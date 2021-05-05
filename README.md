@@ -1,10 +1,9 @@
-# Code for gnomAD LoF flagship manuscript
-
-Manuscript at: [Karczewski et al., 2019](https://www.biorxiv.org/content/10.1101/531210v2)
+# gnomAD LoF analysis
 
 ## Details
+- This repo is based on the gnomAD flagship manuscript [Karczewski et al., 2019](https://www.biorxiv.org/content/10.1101/531210v2) with adaptations to enable efficient targeted usage
 
-This repo serves as a home for two main purposes:
+This repo serves as a home for two main purposes
 - The constraint computation pipeline, written in [Hail 0.2](https://hail.is).
 - The figure-generating code for the manuscript
 
