@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
-
-
-#from constraint_utils import generic
+import argparse
 import pickle
 import copy
 import uuid
 import hail as hl
+from typing import Dict, List, Optional, Set, Tuple
 
+# this is used in various functions, does it need to be passed to them? Yes
+POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
     ds_lengths = ht.aggregate([hl.agg.min(hl.len(ht[f'{prefix}{pop}'])) for pop in pops])
-    # temp_ht = ht.take(1)[0]
-    # ds_lengths = [len(temp_ht[f'{prefix}{pop}']) for pop in pops]
+    temp_ht = ht.take(1)[0]
+    ds_lengths = [len(temp_ht[f'{prefix}{pop}']) for pop in pops]
     pop_lengths = list(zip(ds_lengths, pops))
     print('Found: ', pop_lengths)
     if not skip_assertion:
@@ -207,61 +208,65 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     ht = ht.annotate(**syn_cis[ht.key], **mis_cis[ht.key], **lof_cis[ht.key])
     return calculate_all_z_scores(ht)
 
-def run_tests():
+def run_tests(ht):
     """Tests paths given have correct schema and functions work correctly"""
     print('Tests need to be implemented')
+    print(ht)
 
-def main():
-
-    root = 'gs://gnomad-public/papers/2019-flagship-lof/v1.0'
+def main(args):
+    # Set paths for data access based on command line parameters
+    root = './data'
     po_ht_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'
     raw_constraint_ht_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
-    if args.dataset != 'gnomad':
-        po_coverage_ht_path = po_coverage_ht_path.replace(root, root + f'/{args.dataset}')
-    POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
+    po_output_path = po_ht_path.format(subdir=args.model)
+    output_path = raw_constraint_ht_path.format(subdir=args.model)
+    final_path = final_constraint_ht_path.format(subdir=args.model)
+
+    # Sets method for aggregation, will need to be changed for custom analysis
     MODEL_KEYS = {
         'worst_csq': ['gene'],
         'tx_annotation': ['gene', 'expressed'],
         'standard': ['gene', 'transcript', 'canonical']
     }
-    # Set paths based on input dataset and model
-    po_output_path = po_ht_path.format(subdir=args.model)
-    output_path = raw_constraint_ht_path.format(subdir=args.model)
-    final_path = final_constraint_ht_path.format(subdir=args.model)
-    if args.test:
-        run_tests()
+
+    # this doesn't exist in the rest of the code, is it needed?
+    if args.dataset != 'gnomad':
+        po_coverage_ht_path = po_coverage_ht_path.replace(root, root + f'/{args.dataset}')
     
-    else:
-        if args.aggregate:
-            print('Running aggregation')
-            # read PO hail tables for autosomes, X and Y chromosomes and join them
-            print(f'Reading hail table from {po_output_path}')
-            ht = hl.read_table(po_output_path).union(
-                hl.read_table(po_output_path.replace('.ht', '_x.ht'))
-            ).union(
-                hl.read_table(po_output_path.replace('.ht', '_y.ht'))
-            )
-            # Reannotate gene regions
-            ht = reannotate_gene_regions(ht, {})
-            # group by gene/transcript and calculate summary stats
-            if args.model != 'syn_canonical':
-                ht = finalize_dataset(ht, keys=MODEL_KEYS[args.model])
-            # write hail table to output path
-            ht.write(output_path, args.overwrite)
-            hl.read_table(output_path).export(output_path.replace('.ht', '.txt.bgz'))
-        if args.summarise:
-            print('Finalising summary stats')
-            # write summary stats to output path
-            ht = hl.read_table(output_path)
-            var_types = ('lof', 'mis', 'syn')
-            ht.select(
-                *[f'{t}_{v}{ci}' for v in var_types
-                    for t, ci in zip(('obs', 'exp', 'oe', 'mu', 'oe', 'oe'),
-                                    ('', '', '', '', '_lower', '_upper'))],
-                *[f'{v}_z' for v in var_types], 'pLI', 'pRec', 'pNull', gene_issues=ht.constraint_flag
-            ).select_globals().write(final_path, overwrite=args.overwrite)
-            hl.read_table(final_path).export(final_path.replace('.ht', '.txt.bgz'))
+    if args.test:
+        print(po_output_path)
+        ht = hl.import_table(po_output_path.replace('.ht', '.txt.bgz'))
+        run_tests(ht)
+    if args.aggregate:
+        print('Running aggregation')
+        # read PO hail tables for autosomes, X and Y chromosomes and join them
+        print(f'Reading hail table from {po_output_path}')
+        ht = hl.read_table(po_output_path).union(
+            hl.read_table(po_output_path.replace('.ht', '_x.ht'))
+        ).union(
+            hl.read_table(po_output_path.replace('.ht', '_y.ht'))
+        )
+        # Reannotate gene regions
+        ht = reannotate_gene_regions(ht, {})
+        # group by gene/transcript and calculate summary stats
+        if args.model != 'syn_canonical':
+            ht = finalize_dataset(ht, keys=MODEL_KEYS[args.model])
+        # write hail table to output path
+        ht.write(output_path, args.overwrite)
+        hl.read_table(output_path).export(output_path.replace('.ht', '.txt.bgz'))
+    if args.summarise:
+        print('Finalising summary stats')
+        # write summary stats to output path
+        ht = hl.read_table(output_path)
+        var_types = ('lof', 'mis', 'syn')
+        ht.select(
+            *[f'{t}_{v}{ci}' for v in var_types
+                for t, ci in zip(('obs', 'exp', 'oe', 'mu', 'oe', 'oe'),
+                                ('', '', '', '', '_lower', '_upper'))],
+            *[f'{v}_z' for v in var_types], 'pLI', 'pRec', 'pNull', gene_issues=ht.constraint_flag
+        ).select_globals().write(final_path, overwrite=args.overwrite)
+        hl.read_table(final_path).export(final_path.replace('.ht', '.txt.bgz'))
 
 
 if __name__ == '__main__':

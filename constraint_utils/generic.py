@@ -1,5 +1,5 @@
-from gnomad_hail import *
-from gnomad_hail.utils.plotting import *
+from gnomad import *
+from gnomad.utils.plotting import *
 
 AN_ADJ_FILTER = 0.8
 data_type_sex_counts = {
