@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 import argparse
+import os
 import pickle
 import copy
 import uuid
 import hail as hl
 from typing import Dict, List, Optional, Set, Tuple
 
-# this is used in various functions, does it need to be passed to them? Yes
+# set pops
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
@@ -209,9 +210,38 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     return calculate_all_z_scores(ht)
 
 def run_tests(ht):
-    """Tests paths given have correct schema and functions work correctly"""
-    print('Tests need to be implemented')
-    print(ht)
+    """Tests loading of autosome po table"""
+    ht.show()
+
+def load_or_import(path, overwrite):
+    # Need to specify input format to avoid coercion to string
+    types = {
+        'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_global': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_global': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_afr': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_afr': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_afr': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_amr': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_amr': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_amr': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_eas': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_eas': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_eas': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_nfe': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_nfe': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_nfe': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_sas': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_sas': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_sas': hl.expr.types.tarray(hl.tint32)
+        }
+
+    if os.path.isdir(path) and not overwrite:
+            ht = hl.read_table(path)
+    else:
+        ht = hl.import_table(path.replace('.ht','.txt.bgz'),impute=True,types=types)
+        ht.write(path,overwrite)
+    return ht
 
 def main(args):
     # Set paths for data access based on command line parameters
@@ -229,24 +259,23 @@ def main(args):
         'tx_annotation': ['gene', 'expressed'],
         'standard': ['gene', 'transcript', 'canonical']
     }
-
-    # this doesn't exist in the rest of the code, is it needed?
-    if args.dataset != 'gnomad':
-        po_coverage_ht_path = po_coverage_ht_path.replace(root, root + f'/{args.dataset}')
     
     if args.test:
-        print(po_output_path)
-        ht = hl.import_table(po_output_path.replace('.ht', '.txt.bgz'))
+        ht = load_or_import(po_output_path, args.overwrite)
         run_tests(ht)
+
     if args.aggregate:
         print('Running aggregation')
         # read PO hail tables for autosomes, X and Y chromosomes and join them
         print(f'Reading hail table from {po_output_path}')
-        ht = hl.read_table(po_output_path).union(
-            hl.read_table(po_output_path.replace('.ht', '_x.ht'))
-        ).union(
-            hl.read_table(po_output_path.replace('.ht', '_y.ht'))
-        )
+        # Autosomes
+        ht_autosomes = load_or_import(po_output_path, args.overwrite)
+        # X chromosome
+        ht_x = load_or_import(po_output_path.replace('.ht','_x.ht'), args.overwrite)
+        # Y chromosome
+        ht_y = load_or_import(po_output_path.replace('.ht','_y.ht'), args.overwrite)
+        # Combine into one table
+        ht = ht_autosomes.union(ht_x).union(ht_y)
         # Reannotate gene regions
         ht = reannotate_gene_regions(ht, {})
         # group by gene/transcript and calculate summary stats
@@ -258,7 +287,7 @@ def main(args):
     if args.summarise:
         print('Finalising summary stats')
         # write summary stats to output path
-        ht = hl.read_table(output_path)
+        ht = load_or_import(output_path, args.overwrite)
         var_types = ('lof', 'mis', 'syn')
         ht.select(
             *[f'{t}_{v}{ci}' for v in var_types
