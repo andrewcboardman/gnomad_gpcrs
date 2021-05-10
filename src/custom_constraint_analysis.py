@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Set, Tuple
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
+    '''Get lengths of arrays for each pop'''
     ds_lengths = ht.aggregate([hl.agg.min(hl.len(ht[f'{prefix}{pop}'])) for pop in pops])
     temp_ht = ht.take(1)[0]
     ds_lengths = [len(temp_ht[f'{prefix}{pop}']) for pop in pops]
@@ -22,6 +23,7 @@ def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, s
 
 
 def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool = False) -> hl.Table:
+    '''Aggregate lof variants in genes for each population'''
     agg_expr = {
         'obs_lof': hl.agg.sum(lof_ht.variant_count),
         'mu_lof': hl.agg.sum(lof_ht.mu),
@@ -55,6 +57,7 @@ def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool 
 
 def oe_confidence_interval(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expression,
                            prefix: str = 'oe', alpha: float = 0.05, select_only_ci_metrics: bool = True) -> hl.Table:
+    '''Calculate CI for observed/expected ratio'''
     ht = ht.annotate(_obs=obs, _exp=exp)
     oe_ht = ht.annotate(_range=hl.range(0, 2000).map(lambda x: hl.float64(x) / 1000))
     oe_ht = oe_ht.annotate(_range_dpois=oe_ht._range.map(lambda x: hl.dpois(oe_ht._obs, oe_ht._exp * x)))
@@ -77,6 +80,7 @@ def oe_confidence_interval(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.e
 
 
 def pLI(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expression) -> hl.Table:
+    '''Calculate p(lof intolerant) - metric for constraint'''
     last_pi = {'Null': 0, 'Rec': 0, 'LI': 0}
     pi = {'Null': 1 / 3, 'Rec': 1 / 3, 'LI': 1 / 3}
     expected_values = {'Null': 1, 'Rec': 0.463, 'LI': 0.089}
@@ -97,12 +101,14 @@ def pLI(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expressi
 
 
 def calculate_z(input_ht: hl.Table, obs: hl.expr.NumericExpression, exp: hl.expr.NumericExpression, output: str = 'z_raw') -> hl.Table:
+    '''get significance of a constraint finding'''
     ht = input_ht.select(_obs=obs, _exp=exp)
     ht = ht.annotate(_chisq=(ht._obs - ht._exp) ** 2 / ht._exp)
     return ht.select(**{output: hl.sqrt(ht._chisq) * hl.cond(ht._obs > ht._exp, -1, 1)})
 
 
 def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
+    '''calculate significance for all constraint findings in table'''
     ht = ht.annotate(**calculate_z(ht, ht.obs_syn, ht.exp_syn, 'syn_z_raw')[ht.key])
     ht = ht.annotate(**calculate_z(ht, ht.obs_mis, ht.exp_mis, 'mis_z_raw')[ht.key])
     ht = ht.annotate(**calculate_z(ht, ht.obs_lof, ht.exp_lof, 'lof_z_raw')[ht.key])
@@ -150,6 +156,7 @@ def reannotate_gene_regions(ht, annotation_flags):
 
 def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 'canonical'),
                      n_partitions: int = 1000) -> hl.Table:
+    '''aggregate variants to calculate constraint metrics and significance'''
     # This function aggregates over genes in all cases, as XG spans PAR and non-PAR X
     po_ht = po_ht.repartition(n_partitions).persist()
 
@@ -169,6 +176,7 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     lof_ht = po_ht.filter(po_ht.modifier == 'HC')
     lof_ht = collapse_lof_ht(lof_ht, keys, False)
 
+    # Aggregate missense variants
     mis_ht = po_ht.filter(po_ht.annotation == 'missense_variant')
     agg_expr = {
         'obs_mis': hl.agg.sum(mis_ht.variant_count),
@@ -182,11 +190,13 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         agg_expr[f'obs_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'downsampling_counts_{pop}'])
     mis_ht = mis_ht.group_by(*keys).aggregate(**agg_expr)
 
+    # alter this to get pphen CIs?
     pphen_mis_ht = po_ht.filter(po_ht.modifier == 'probably_damaging')
     pphen_mis_ht = pphen_mis_ht.group_by(*keys).aggregate(obs_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count),
                                                           exp_mis_pphen=hl.agg.sum(pphen_mis_ht.expected_variants),
                                                           oe_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count) / hl.agg.sum(pphen_mis_ht.expected_variants),
                                                           possible_mis_pphen=hl.agg.sum(pphen_mis_ht.possible_variants))
+    # Aggregate synonymous variants                                
     syn_ht = po_ht.filter(po_ht.annotation == 'synonymous_variant').key_by(*keys)
     agg_expr = {
         'obs_syn': hl.agg.sum(syn_ht.variant_count),
@@ -200,21 +210,27 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         agg_expr[f'obs_syn_{pop}'] = hl.agg.array_sum(syn_ht[f'downsampling_counts_{pop}'])
     syn_ht = syn_ht.group_by(*keys).aggregate(**agg_expr)
 
+    # join constraint metrics
     ht = lof_ht_classic.annotate(**mis_ht[lof_ht_classic.key], **pphen_mis_ht[lof_ht_classic.key],
                                  **syn_ht[lof_ht_classic.key], **lof_ht[lof_ht_classic.key],
                                  **lof_ht_classic_hc[lof_ht_classic.key])
+    # calculate confidence intervals
     syn_cis = oe_confidence_interval(ht, ht.obs_syn, ht.exp_syn, prefix='oe_syn')
     mis_cis = oe_confidence_interval(ht, ht.obs_mis, ht.exp_mis, prefix='oe_mis')
     lof_cis = oe_confidence_interval(ht, ht.obs_lof, ht.exp_lof, prefix='oe_lof')
+    # join confidence intervals
     ht = ht.annotate(**syn_cis[ht.key], **mis_cis[ht.key], **lof_cis[ht.key])
-    return calculate_all_z_scores(ht)
+    # Calculate significance
+    ht_z = calculate_all_z_scores(ht)
+    return ht_z
 
 def run_tests(ht):
     """Tests loading of autosome po table"""
+    # Incorporate more tests to check that aggregation by new variant annotations is legit
     ht.show()
 
 def load_or_import(path, overwrite):
-    # Need to specify input format to avoid coercion to string
+    # Specify input format to avoid coercion to string
     types = {
         'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
         'expected_variants_global': hl.expr.types.tarray(hl.tfloat64),
