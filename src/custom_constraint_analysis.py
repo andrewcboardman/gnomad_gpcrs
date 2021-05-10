@@ -109,9 +109,13 @@ def calculate_z(input_ht: hl.Table, obs: hl.expr.NumericExpression, exp: hl.expr
 
 def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
     '''calculate significance for all constraint findings in table'''
+
+    # Raw z scores from chi squared distribution
     ht = ht.annotate(**calculate_z(ht, ht.obs_syn, ht.exp_syn, 'syn_z_raw')[ht.key])
     ht = ht.annotate(**calculate_z(ht, ht.obs_mis, ht.exp_mis, 'mis_z_raw')[ht.key])
     ht = ht.annotate(**calculate_z(ht, ht.obs_lof, ht.exp_lof, 'lof_z_raw')[ht.key])
+    ht = ht.annotate(**calculate_z(ht, ht.obs_mis_pphen, ht.exp_mis_pphen, 'mis_pphen_z_raw')[ht.key])
+    ht = ht.annotate(**calculate_z(ht, ht.obs_mis_non_pphen, ht.exp_mis_non_pphen, 'mis_non_pphen_z_raw')[ht.key])
     reasons = hl.empty_set(hl.tstr)
     reasons = hl.cond(hl.or_else(ht.obs_syn, 0) + hl.or_else(ht.obs_mis, 0) + hl.or_else(ht.obs_lof, 0) == 0, reasons.add('no_variants'), reasons)
     reasons = hl.cond(ht.exp_syn > 0, reasons, reasons.add('no_exp_syn'), missing_false=True)
@@ -141,18 +145,33 @@ def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
             ~ht.constraint_flag.contains('no_exp_lof') &
             hl.is_defined(ht.lof_z_raw) & (ht.lof_z_raw < 0),
             hl.agg.explode(lambda x: hl.agg.stats(x), [ht.lof_z_raw, -ht.lof_z_raw])
+        ).stdev,
+        mis_pphen_sd=hl.agg.filter(
+            ~ht.constraint_flag.contains('no_variants') &
+            ~ht.constraint_flag.contains('mis_outlier') &
+            ~ht.constraint_flag.contains('no_exp_mis') &
+            hl.is_defined(ht.mis_pphen_z_raw) & (ht.mis_pphen_z_raw < 0),
+            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_pphen_z_raw, -ht.mis_pphen_z_raw])
+        ).stdev,
+        mis_non_pphen_sd=hl.agg.filter(
+            ~ht.constraint_flag.contains('no_variants') &
+            ~ht.constraint_flag.contains('mis_outlier') &
+            ~ht.constraint_flag.contains('no_exp_mis') &
+            hl.is_defined(ht.mis_non_pphen_z_raw) & (ht.mis_non_pphen_z_raw < 0),
+            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_non_pphen_z_raw, -ht.mis_non_pphen_z_raw])
         ).stdev
     ))
     print(sds)
     ht = ht.annotate_globals(**sds)
-    return ht.transmute(syn_z=ht.syn_z_raw / sds.syn_sd,
-                        mis_z=ht.mis_z_raw / sds.mis_sd,
-                        lof_z=ht.lof_z_raw / sds.lof_sd)
+    ht_z = ht.transmute(
+        syn_z=ht.syn_z_raw / sds.syn_sd,
+        mis_z=ht.mis_z_raw / sds.mis_sd,
+        lof_z=ht.lof_z_raw / sds.lof_sd,
+        mis_pphen_z=ht.mis_pphen_z_raw / sds.mis_pphen_sd,
+        mis_non_pphen_z=ht.mis_non_pphen_z_raw / sds.mis_non_pphen_sd
+    )
+    return ht_z
 
-    
-def reannotate_gene_regions(ht, annotation_flags):
-    '''Function to add custom gene annotations'''
-    return ht
 
 def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 'canonical'),
                      n_partitions: int = 1000) -> hl.Table:
@@ -190,12 +209,20 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         agg_expr[f'obs_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'downsampling_counts_{pop}'])
     mis_ht = mis_ht.group_by(*keys).aggregate(**agg_expr)
 
-    # alter this to get pphen CIs?
+    # Aggregate pphen and non-pphen variants
     pphen_mis_ht = po_ht.filter(po_ht.modifier == 'probably_damaging')
     pphen_mis_ht = pphen_mis_ht.group_by(*keys).aggregate(obs_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count),
                                                           exp_mis_pphen=hl.agg.sum(pphen_mis_ht.expected_variants),
                                                           oe_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count) / hl.agg.sum(pphen_mis_ht.expected_variants),
                                                           possible_mis_pphen=hl.agg.sum(pphen_mis_ht.possible_variants))
+
+    non_pphen_mis_ht = po_ht.filter(po_ht.modifier != 'probably_damaging')
+    non_pphen_mis_ht = non_pphen_mis_ht.group_by(*keys).aggregate(obs_mis_non_pphen=hl.agg.sum(pphen_mis_ht.variant_count),
+                                                          exp_mis_non_pphen=hl.agg.sum(pphen_mis_ht.expected_variants),
+                                                          oe_mis_non_pphen=hl.agg.sum(pphen_mis_ht.variant_count) / hl.agg.sum(pphen_mis_ht.expected_variants),
+                                                          possible_mis_non_pphen=hl.agg.sum(pphen_mis_ht.possible_variants))
+
+            
     # Aggregate synonymous variants                                
     syn_ht = po_ht.filter(po_ht.annotation == 'synonymous_variant').key_by(*keys)
     agg_expr = {
@@ -211,15 +238,30 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     syn_ht = syn_ht.group_by(*keys).aggregate(**agg_expr)
 
     # join constraint metrics
-    ht = lof_ht_classic.annotate(**mis_ht[lof_ht_classic.key], **pphen_mis_ht[lof_ht_classic.key],
-                                 **syn_ht[lof_ht_classic.key], **lof_ht[lof_ht_classic.key],
-                                 **lof_ht_classic_hc[lof_ht_classic.key])
+    ht = lof_ht_classic.annotate(
+        **mis_ht[lof_ht_classic.key], 
+        **pphen_mis_ht[lof_ht_classic.key],
+        **non_pphen_mis_ht[lof_ht_classic.key],
+        **syn_ht[lof_ht_classic.key], 
+        **lof_ht[lof_ht_classic.key],
+        **lof_ht_classic_hc[lof_ht_classic.key]
+        )
+
     # calculate confidence intervals
     syn_cis = oe_confidence_interval(ht, ht.obs_syn, ht.exp_syn, prefix='oe_syn')
     mis_cis = oe_confidence_interval(ht, ht.obs_mis, ht.exp_mis, prefix='oe_mis')
     lof_cis = oe_confidence_interval(ht, ht.obs_lof, ht.exp_lof, prefix='oe_lof')
+    mis_pphen_cis = oe_confidence_interval(ht, ht.obs_mis_pphen, ht.exp_mis_pphen, prefix='oe_mis_pphen')
+    mis_non_pphen_cis = oe_confidence_interval(ht, ht.obs_mis_non_pphen, ht.exp_mis_non_pphen, prefix='oe_mis_non_pphen')
+
     # join confidence intervals
-    ht = ht.annotate(**syn_cis[ht.key], **mis_cis[ht.key], **lof_cis[ht.key])
+    ht = ht.annotate(
+        **syn_cis[ht.key], 
+        **mis_cis[ht.key], 
+        **lof_cis[ht.key],
+        **pphen_mis_cis[ht.key],
+        **non_pphen_mis_cis[ht.key]
+        )
     # Calculate significance
     ht_z = calculate_all_z_scores(ht)
     return ht_z
@@ -292,24 +334,27 @@ def main(args):
         ht_y = load_or_import(po_output_path.replace('.ht','_y.ht'), args.overwrite)
         # Combine into one table
         ht = ht_autosomes.union(ht_x).union(ht_y)
-        # Reannotate gene regions
-        ht = reannotate_gene_regions(ht, {})
         # group by gene/transcript and calculate summary stats
         if args.model != 'syn_canonical':
             ht = finalize_dataset(ht, keys=MODEL_KEYS[args.model])
         # write hail table to output path
         ht.write(output_path, args.overwrite)
         hl.read_table(output_path).export(output_path.replace('.ht', '.txt.bgz'))
+
     if args.summarise:
         print('Finalising summary stats')
         # write summary stats to output path
         ht = load_or_import(output_path, args.overwrite)
-        var_types = ('lof', 'mis', 'syn')
+        mut_types = ('lof', 'mis', 'syn','mis_pphen','mis_non_pphen')
+        output_var_types = zip(('obs', 'exp', 'oe', 'oe', 'oe'),
+                                ('', '', '', '_lower', '_upper'))
         ht.select(
-            *[f'{t}_{v}{ci}' for v in var_types
-                for t, ci in zip(('obs', 'exp', 'oe', 'mu', 'oe', 'oe'),
-                                ('', '', '', '', '_lower', '_upper'))],
-            *[f'{v}_z' for v in var_types], 'pLI', 'pRec', 'pNull', gene_issues=ht.constraint_flag
+            *[f'{t}_{m}{ci}' \
+                for m in mut_types \
+                for t, ci in output_var_types],
+            *[f'{m}_z' for m in mut_types], 
+            'pLI', 'pRec', 'pNull', 
+            gene_issues=ht.constraint_flag
         ).select_globals().write(final_path, overwrite=args.overwrite)
         hl.read_table(final_path).export(final_path.replace('.ht', '.txt.bgz'))
 
