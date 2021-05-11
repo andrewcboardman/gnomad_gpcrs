@@ -305,9 +305,16 @@ def load_or_import(path, overwrite):
 def main(args):
     # Set paths for data access based on command line parameters
     root = './data'
+    
+    context_ht_path = f'{root}/context/Homo_sapiens_assembly19.fasta.snps_only.vep_20181129.ht'
+    processed_genomes_ht_path = f'{root}/model/genomes_processed.ht'
+    processed_exomes_ht_path = f'{root}/model/exomes_processed.ht'
+    mutation_rate_ht_path = f'{root}/model/mutation_rate_methylation_bins.ht'
+    po_coverage_ht_path = f'{root}/model/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
     po_ht_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'
     raw_constraint_ht_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
+
     po_output_path = po_ht_path.format(subdir=args.model)
     output_path = raw_constraint_ht_path.format(subdir=args.model)
     final_path = final_constraint_ht_path.format(subdir=args.model)
@@ -322,6 +329,60 @@ def main(args):
     if args.test:
         ht = load_or_import(po_output_path, args.overwrite)
         run_tests(ht)
+
+    if args.get_proportion_observed:
+
+        full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers)
+       #full_genome_ht = prepare_ht(hl.read_table(processed_genomes_ht_path), args.trimers)
+        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers)
+
+        context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
+        #genome_ht = full_genome_ht.filter(full_genome_ht.locus.in_autosome_or_par())
+        exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
+
+        context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
+        context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
+        context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
+        context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
+
+        exome_x_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('X')])
+        exome_x_ht = exome_x_ht.filter(exome_x_ht.locus.in_x_nonpar())
+        exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
+        exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
+
+        # mutation rate
+        mutation_ht = hl.read_table(mutation_rate_ht_path).select('mu_snp')
+
+        # Get proportion observed tables
+        coverage_ht = hl.read_table(po_coverage_ht_path)
+        coverage_x_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_x.ht'))
+        coverage_y_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_y.ht'))
+
+        # Build models for mutation frequency based on context
+        coverage_model, plateau_models = build_models(coverage_ht, args.trimers, True)
+        _, plateau_x_models = build_models(coverage_x_ht, args.trimers, True)
+        _, plateau_y_models = build_models(coverage_y_ht, args.trimers, True)
+
+        get_proportion_observed(exome_ht, context_ht, mutation_ht, plateau_models,
+                                coverage_model, recompute_possible=True,
+                                custom_model=args.model, dataset=args.dataset,
+                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
+                                ).write(po_output_path, overwrite=args.overwrite)
+        hl.read_table(po_output_path).export(po_output_path.replace('.ht', '.txt.bgz'))
+
+        get_proportion_observed(exome_x_ht, context_x_ht, mutation_ht, plateau_x_models,
+                                coverage_model, recompute_possible=True,
+                                custom_model=args.model, dataset=args.dataset,
+                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
+                                ).write(po_output_path.replace('.ht', '_x.ht'), overwrite=args.overwrite)
+        hl.read_table(po_output_path.replace('.ht', '_x.ht')).export(po_output_path.replace('.ht', '_x.txt.bgz'))
+
+        get_proportion_observed(exome_y_ht, context_y_ht, mutation_ht, plateau_y_models,
+                                coverage_model, recompute_possible=True,
+                                custom_model=args.model, dataset=args.dataset,
+                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
+                                ).write(po_output_path.replace('.ht', '_y.ht'), overwrite=args.overwrite)
+        hl.read_table(po_output_path.replace('.ht', '_y.ht')).export(po_output_path.replace('.ht', '_y.txt.bgz'))
 
     if args.aggregate:
         print('Running aggregation')
@@ -366,7 +427,9 @@ if __name__ == '__main__':
     parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
     parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now)', default='standard')
-    parser.add_argument('--aggregate', help='Get p_obs table and aggregate', action='store_true')
+    parser.add_argument('--skip_af_filter_upfront', help='Skip AF filter up front (to be applied later to ensure that it is not affecting population-specific constraint): not generally recommended', action='store_true')
+    parser.add_argument('--apply_model',help='Apply model to calculate proportion observed')
+    parser.add_argument('--aggregate', help='Aggregate p_obs table', action='store_true')
     parser.add_argument('--summarise', help='Report summary stats', action='store_true')
     args = parser.parse_args()
     main(args)
