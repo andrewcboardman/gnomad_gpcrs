@@ -4,6 +4,7 @@ import os
 import pickle
 import copy
 import uuid
+from itertools import product
 import hail as hl
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -146,30 +147,30 @@ def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
             hl.is_defined(ht.lof_z_raw) & (ht.lof_z_raw < 0),
             hl.agg.explode(lambda x: hl.agg.stats(x), [ht.lof_z_raw, -ht.lof_z_raw])
         ).stdev,
-        mis_pphen_sd=hl.agg.filter(
-            ~ht.constraint_flag.contains('no_variants') &
-            ~ht.constraint_flag.contains('mis_outlier') &
-            ~ht.constraint_flag.contains('no_exp_mis') &
-            hl.is_defined(ht.mis_pphen_z_raw) & (ht.mis_pphen_z_raw < 0),
-            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_pphen_z_raw, -ht.mis_pphen_z_raw])
-        ).stdev,
-        mis_non_pphen_sd=hl.agg.filter(
-            ~ht.constraint_flag.contains('no_variants') &
-            ~ht.constraint_flag.contains('mis_outlier') &
-            ~ht.constraint_flag.contains('no_exp_mis') &
-            hl.is_defined(ht.mis_non_pphen_z_raw) & (ht.mis_non_pphen_z_raw < 0),
-            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_non_pphen_z_raw, -ht.mis_non_pphen_z_raw])
-        ).stdev
+        # mis_pphen_sd=hl.agg.filter(
+        #     ~ht.constraint_flag.contains('no_variants') &
+        #     ~ht.constraint_flag.contains('mis_outlier') &
+        #     ~ht.constraint_flag.contains('no_exp_mis') &
+        #     hl.is_defined(ht.mis_pphen_z_raw) & (ht.mis_pphen_z_raw < 0),
+        #     hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_pphen_z_raw, -ht.mis_pphen_z_raw])
+        # ).stdev,
+        # mis_non_pphen_sd=hl.agg.filter(
+        #     ~ht.constraint_flag.contains('no_variants') &
+        #     ~ht.constraint_flag.contains('mis_outlier') &
+        #     ~ht.constraint_flag.contains('no_exp_mis') &
+        #     hl.is_defined(ht.mis_non_pphen_z_raw) & (ht.mis_non_pphen_z_raw < 0),
+        #     hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_non_pphen_z_raw, -ht.mis_non_pphen_z_raw])
+        # ).stdev
     ))
     print(sds)
     ht = ht.annotate_globals(**sds)
-    ht_z = ht.transmute(
-        syn_z=ht.syn_z_raw / sds.syn_sd,
-        mis_z=ht.mis_z_raw / sds.mis_sd,
-        lof_z=ht.lof_z_raw / sds.lof_sd,
-        mis_pphen_z=ht.mis_pphen_z_raw / sds.mis_pphen_sd,
-        mis_non_pphen_z=ht.mis_non_pphen_z_raw / sds.mis_non_pphen_sd
-    )
+    # ht_z = ht.transmute(
+    #     syn_z=ht.syn_z_raw / sds.syn_sd,
+    #     mis_z=ht.mis_z_raw / sds.mis_sd,
+    #     lof_z=ht.lof_z_raw / sds.lof_sd,
+    #     #mis_pphen_z=ht.mis_pphen_z_raw / sds.mis_pphen_sd,
+    #     #mis_non_pphen_z=ht.mis_non_pphen_z_raw / sds.mis_non_pphen_sd
+    # )
     return ht_z
 
 
@@ -209,18 +210,18 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         agg_expr[f'obs_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'downsampling_counts_{pop}'])
     mis_ht = mis_ht.group_by(*keys).aggregate(**agg_expr)
 
-    # Aggregate pphen and non-pphen variants
-    pphen_mis_ht = po_ht.filter(po_ht.modifier == 'probably_damaging')
-    pphen_mis_ht = pphen_mis_ht.group_by(*keys).aggregate(obs_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count),
-                                                          exp_mis_pphen=hl.agg.sum(pphen_mis_ht.expected_variants),
-                                                          oe_mis_pphen=hl.agg.sum(pphen_mis_ht.variant_count) / hl.agg.sum(pphen_mis_ht.expected_variants),
-                                                          possible_mis_pphen=hl.agg.sum(pphen_mis_ht.possible_variants))
+    # Aggregate pphen and non-pphen missense variants
+    mis_pphen_ht = po_ht.filter(po_ht.modifier == 'probably_damaging')
+    mis_pphen_ht = mis_pphen_ht.group_by(*keys).aggregate(obs_mis_pphen=hl.agg.sum(mis_pphen_ht.variant_count),
+                                                          exp_mis_pphen=hl.agg.sum(mis_pphen_ht.expected_variants),
+                                                          oe_mis_pphen=hl.agg.sum(mis_pphen_ht.variant_count) / hl.agg.sum(mis_pphen_ht.expected_variants),
+                                                          possible_mis_pphen=hl.agg.sum(mis_pphen_ht.possible_variants))
 
-    non_pphen_mis_ht = po_ht.filter(po_ht.modifier != 'probably_damaging')
-    non_pphen_mis_ht = non_pphen_mis_ht.group_by(*keys).aggregate(obs_mis_non_pphen=hl.agg.sum(pphen_mis_ht.variant_count),
-                                                          exp_mis_non_pphen=hl.agg.sum(pphen_mis_ht.expected_variants),
-                                                          oe_mis_non_pphen=hl.agg.sum(pphen_mis_ht.variant_count) / hl.agg.sum(pphen_mis_ht.expected_variants),
-                                                          possible_mis_non_pphen=hl.agg.sum(pphen_mis_ht.possible_variants))
+    mis_non_pphen_ht = po_ht.filter(po_ht.modifier != 'probably_damaging')
+    mis_non_pphen_ht = mis_non_pphen_ht.group_by(*keys).aggregate(obs_mis_non_pphen=hl.agg.sum(mis_non_pphen_ht.variant_count),
+                                                          exp_mis_non_pphen=hl.agg.sum(mis_non_pphen_ht.expected_variants),
+                                                          oe_mis_non_pphen=hl.agg.sum(mis_non_pphen_ht.variant_count) / hl.agg.sum(mis_non_pphen_ht.expected_variants),
+                                                          possible_mis_non_pphen=hl.agg.sum(mis_non_pphen_ht.possible_variants))
 
             
     # Aggregate synonymous variants                                
@@ -240,8 +241,8 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     # join constraint metrics
     ht = lof_ht_classic.annotate(
         **mis_ht[lof_ht_classic.key], 
-        **pphen_mis_ht[lof_ht_classic.key],
-        **non_pphen_mis_ht[lof_ht_classic.key],
+        **mis_pphen_ht[lof_ht_classic.key],
+        **mis_non_pphen_ht[lof_ht_classic.key],
         **syn_ht[lof_ht_classic.key], 
         **lof_ht[lof_ht_classic.key],
         **lof_ht_classic_hc[lof_ht_classic.key]
@@ -259,12 +260,12 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         **syn_cis[ht.key], 
         **mis_cis[ht.key], 
         **lof_cis[ht.key],
-        **pphen_mis_cis[ht.key],
-        **non_pphen_mis_cis[ht.key]
+        **mis_pphen_cis[ht.key],
+        **mis_non_pphen_cis[ht.key]
         )
     # Calculate significance
-    ht_z = calculate_all_z_scores(ht)
-    return ht_z
+    #ht = calculate_all_z_scores(ht)
+    return ht
 
 def run_tests(ht):
     """Tests loading of autosome po table"""
@@ -348,13 +349,13 @@ def main(args):
         mut_types = ('lof', 'mis', 'syn','mis_pphen','mis_non_pphen')
         output_var_types = zip(('obs', 'exp', 'oe', 'oe', 'oe'),
                                 ('', '', '', '_lower', '_upper'))
+        output_vars = product(mut_types,output_var_types)
         ht.select(
-            *[f'{t}_{m}{ci}' \
-                for m in mut_types \
-                for t, ci in output_var_types],
-            *[f'{m}_z' for m in mut_types], 
+            'gene','transcript','canonical',
+            *[f'{t}_{m}{ci}' for m, (t, ci) in output_vars],
+            #*[f'{m}_z' for m in mut_types[:3]], 
             'pLI', 'pRec', 'pNull', 
-            gene_issues=ht.constraint_flag
+            #gene_issues=ht.constraint_flag
         ).select_globals().write(final_path, overwrite=args.overwrite)
         hl.read_table(final_path).export(final_path.replace('.ht', '.txt.bgz'))
 
