@@ -7,171 +7,134 @@ import uuid
 from itertools import product
 import hail as hl
 from typing import Dict, List, Optional, Set, Tuple
+from gnomad.utils.vep import *
+from .utils import *
 
 # set pops
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
-
-def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
-    '''Get lengths of arrays for each pop'''
-    ds_lengths = ht.aggregate([hl.agg.min(hl.len(ht[f'{prefix}{pop}'])) for pop in pops])
-    temp_ht = ht.take(1)[0]
-    ds_lengths = [len(temp_ht[f'{prefix}{pop}']) for pop in pops]
-    pop_lengths = list(zip(ds_lengths, pops))
-    print('Found: ', pop_lengths)
-    if not skip_assertion:
-        assert ht.all(hl.all(lambda f: f, [hl.len(ht[f'{prefix}{pop}']) == length for length, pop in pop_lengths]))
-    return pop_lengths
+HIGH_COVERAGE_CUTOFF = 40
 
 
-def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool = False) -> hl.Table:
-    '''Aggregate lof variants in genes for each population'''
+
+def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table,
+                            plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
+                            recompute_possible: bool = False, remove_from_denominator: bool = True,
+                            custom_model: str = None, dataset: str = 'gnomad',
+                            impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
+
+    exome_ht = add_most_severe_csq_to_tc_within_ht(exome_ht)
+    context_ht = add_most_severe_csq_to_tc_within_ht(context_ht)
+
+    if custom_model == 'syn_canonical':
+        context_ht = take_one_annotation_from_tc_within_ht(fast_filter_vep(context_ht))
+        context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
+        exome_ht = take_one_annotation_from_tc_within_ht(fast_filter_vep(exome_ht))
+        exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
+    elif custom_model == 'worst_csq':
+        context_ht = process_consequences(context_ht)
+        context_ht = context_ht.transmute(worst_csq_by_gene=context_ht.vep.worst_csq_by_gene)
+        context_ht = context_ht.explode(context_ht.worst_csq_by_gene)
+        exome_ht = process_consequences(exome_ht)
+        exome_ht = exome_ht.transmute(worst_csq_by_gene=exome_ht.vep.worst_csq_by_gene)
+        exome_ht = exome_ht.explode(exome_ht.worst_csq_by_gene)
+    elif custom_model == 'tx_annotation':
+        tx_ht = load_tx_expression_data()
+        context_ht = context_ht.annotate(**tx_ht[context_ht.key])
+        context_ht = context_ht.explode(context_ht.tx_annotation)
+        tx_ht = load_tx_expression_data(context=False)
+        exome_ht = exome_ht.annotate(**tx_ht[exome_ht.key])
+        exome_ht = exome_ht.explode(exome_ht.tx_annotation)
+    elif custom_model == 'distance_to_splice':
+        context_ht = annotate_distance_to_splice(context_ht)
+        exome_ht = annotate_distance_to_splice(exome_ht)
+        # TODO:
+        # context_ht = context_ht.explode(context_ht.tx_annotation)
+        # exome_ht = exome_ht.explode(exome_ht.tx_annotation)
+    else:
+        context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
+        context_ht = context_ht.explode(context_ht.transcript_consequences)
+        exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
+        exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
+
+    context_ht, _ = annotate_constraint_groupings(context_ht, custom_model=custom_model)
+    exome_ht, grouping = annotate_constraint_groupings(exome_ht, custom_model=custom_model)
+
+    context_ht = context_ht.filter(hl.is_defined(context_ht.exome_coverage)).select(
+        'context', 'ref', 'alt', 'methylation_level', *grouping)
+    exome_ht = exome_ht.select(
+        'context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)
+
+    af_cutoff = 0.001
+
+    freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
+
+    def keep_criteria(ht):
+        crit = (ht.freq[freq_index].AC > 0) & ht.pass_filters & (ht.coverage > 0)
+        if impose_high_af_cutoff_upfront:
+            crit &= (ht.freq[freq_index].AF <= af_cutoff)
+        return crit
+
+    exome_join = exome_ht[context_ht.key]
+    if remove_from_denominator:
+        context_ht = context_ht.filter(hl.is_missing(exome_join) | keep_criteria(exome_join))
+
+    exome_ht = exome_ht.filter(keep_criteria(exome_ht))
+
+    possible_file = f'{root}/model/possible_data/possible_transcript_pop_{custom_model}.ht'
+    possible_variants_ht = hl.read_table(possible_file)
+
+    ht = count_variants(exome_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True,
+                        count_downsamplings=POPS, impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront)
+    ht = ht.join(possible_variants_ht, 'outer')
+    ht.write(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht', True)
+    ht = hl.read_table(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht')
+
+    grouping.remove('coverage')
     agg_expr = {
-        'obs_lof': hl.agg.sum(lof_ht.variant_count),
-        'mu_lof': hl.agg.sum(lof_ht.mu),
-        'possible_lof': hl.agg.sum(lof_ht.possible_variants),
-        'exp_lof': hl.agg.sum(lof_ht.expected_variants)
+        'variant_count': hl.agg.sum(ht.variant_count),
+        'adjusted_mutation_rate': hl.agg.sum(ht.adjusted_mutation_rate),
+        'possible_variants': hl.agg.sum(ht.possible_variants),
+        'expected_variants': hl.agg.sum(ht.expected_variants),
+        'mu': hl.agg.sum(ht.mu)
     }
     for pop in POPS:
-        agg_expr[f'exp_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'expected_variants_{pop}'])
-        agg_expr[f'obs_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'downsampling_counts_{pop}'])
-    lof_ht = lof_ht.group_by(*keys).aggregate(**agg_expr).persist()
-    lof_ht = lof_ht.filter(lof_ht.exp_lof > 0)
-    if calculate_pop_pLI:
-        pop_lengths = get_all_pop_lengths(lof_ht, 'obs_lof_')
-        print(pop_lengths)
-        for pop_length, pop in pop_lengths:
-            print(f'Calculating pLI for {pop}...')
-            plis = []
-            for i in range(8, pop_length):
-                print(i)
-                ht = lof_ht.filter(lof_ht[f'exp_lof_{pop}'][i] > 0)
-                pli_ht = pLI(ht, ht[f'obs_lof_{pop}'][i], ht[f'exp_lof_{pop}'][i])
-                plis.append(pli_ht[lof_ht.key])
-            lof_ht = lof_ht.annotate(**{
-                f'pLI_{pop}': [pli.pLI for pli in plis],
-                f'pRec_{pop}': [pli.pRec for pli in plis],
-                f'pNull_{pop}': [pli.pNull for pli in plis],
-            })
-    return lof_ht.annotate(
-        **pLI(lof_ht, lof_ht.obs_lof, lof_ht.exp_lof)[lof_ht.key],
-        oe_lof=lof_ht.obs_lof / lof_ht.exp_lof).key_by(*keys)
+        agg_expr[f'adjusted_mutation_rate_{pop}'] = hl.agg.array_sum(ht[f'adjusted_mutation_rate_{pop}'])
+        agg_expr[f'expected_variants_{pop}'] = hl.agg.array_sum(ht[f'expected_variants_{pop}'])
+        agg_expr[f'downsampling_counts_{pop}'] = hl.agg.array_sum(ht[f'downsampling_counts_{pop}'])
+    ht = ht.group_by(*grouping).partition_hint(1000).aggregate(**agg_expr)
+    return ht.annotate(obs_exp=ht.variant_count / ht.expected_variants)
 
-def oe_confidence_interval(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expression,
-                           prefix: str = 'oe', alpha: float = 0.05, select_only_ci_metrics: bool = True) -> hl.Table:
-    '''Calculate CI for observed/expected ratio'''
-    ht = ht.annotate(_obs=obs, _exp=exp)
-    oe_ht = ht.annotate(_range=hl.range(0, 2000).map(lambda x: hl.float64(x) / 1000))
-    oe_ht = oe_ht.annotate(_range_dpois=oe_ht._range.map(lambda x: hl.dpois(oe_ht._obs, oe_ht._exp * x)))
+def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False,
+                 ) -> Tuple[Tuple[float, float], Dict[str, Tuple[float, float]]]:
+    keys = ['context', 'ref', 'alt', 'methylation_level', 'mu_snp']
 
-    oe_ht = oe_ht.transmute(_cumulative_dpois=hl.cumulative_sum(oe_ht._range_dpois))
-    max_cumulative_dpois = oe_ht._cumulative_dpois[-1]
-    oe_ht = oe_ht.transmute(_norm_dpois=oe_ht._cumulative_dpois.map(lambda x: x / max_cumulative_dpois))
-    oe_ht = oe_ht.transmute(
-        _lower_idx=hl.argmax(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x < alpha, x))),
-        _upper_idx=hl.argmin(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x > 1 - alpha, x)))
-    )
-    oe_ht = oe_ht.transmute(**{
-        f'{prefix}_lower': hl.cond(oe_ht._obs > 0, oe_ht._range[oe_ht._lower_idx], 0),
-        f'{prefix}_upper': oe_ht._range[oe_ht._upper_idx]
-    })
-    if select_only_ci_metrics:
-        return oe_ht.select(f'{prefix}_lower', f'{prefix}_upper')
-    else:
-        return oe_ht.drop('_exp')
+    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
+    all_high_coverage_ht = coverage_ht.filter(coverage_ht.exome_coverage >= cov_cutoff)
+    agg_expr = {
+        'observed_variants': hl.agg.sum(all_high_coverage_ht.variant_count),
+        'possible_variants': hl.agg.sum(all_high_coverage_ht.possible_variants)
+    }
+    for pop in POPS:
+        agg_expr[f'observed_{pop}'] = hl.agg.array_sum(all_high_coverage_ht[f'downsampling_counts_{pop}'])
+    high_coverage_ht = all_high_coverage_ht.group_by(*keys).aggregate(**agg_expr)
 
+    high_coverage_ht = annotate_variant_types(high_coverage_ht, not trimers)
+    plateau_models = build_plateau_models_pop(high_coverage_ht, weighted=weighted)
 
-def pLI(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expression) -> hl.Table:
-    '''Calculate p(lof intolerant) - metric for constraint'''
-    last_pi = {'Null': 0, 'Rec': 0, 'LI': 0}
-    pi = {'Null': 1 / 3, 'Rec': 1 / 3, 'LI': 1 / 3}
-    expected_values = {'Null': 1, 'Rec': 0.463, 'LI': 0.089}
-    ht = ht.annotate(_obs=obs, _exp=exp)
+    high_coverage_scale_factor = all_high_coverage_ht.aggregate(
+        hl.agg.sum(all_high_coverage_ht.variant_count) /
+        hl.agg.sum(all_high_coverage_ht.possible_variants * all_high_coverage_ht.mu_snp))
 
-    while abs(pi['LI'] - last_pi['LI']) > 0.001:
-        last_pi = copy.deepcopy(pi)
-        ht = ht.annotate(
-            **{k: v * hl.dpois(ht._obs, ht._exp * expected_values[k]) for k, v in pi.items()})
-        ht = ht.annotate(row_sum=hl.sum([ht[k] for k in pi]))
-        ht = ht.annotate(**{k: ht[k] / ht.row_sum for k, v in pi.items()})
-        pi = ht.aggregate({k: hl.agg.mean(ht[k]) for k in pi.keys()})
+    all_low_coverage_ht = coverage_ht.filter((coverage_ht.exome_coverage < cov_cutoff) &
+                                             (coverage_ht.exome_coverage > 0))
 
-    ht = ht.annotate(
-        **{k: v * hl.dpois(ht._obs, ht._exp * expected_values[k]) for k, v in pi.items()})
-    ht = ht.annotate(row_sum=hl.sum([ht[k] for k in pi]))
-    return ht.select(**{f'p{k}': ht[k] / ht.row_sum for k, v in pi.items()})
+    low_coverage_ht = all_low_coverage_ht.group_by(log_coverage=hl.log10(all_low_coverage_ht.exome_coverage)).aggregate(
+        low_coverage_obs_exp=hl.agg.sum(all_low_coverage_ht.variant_count) /
+                             (high_coverage_scale_factor * hl.agg.sum(all_low_coverage_ht.possible_variants * all_low_coverage_ht.mu_snp)))
+    coverage_model = build_coverage_model(low_coverage_ht)
+    # TODO: consider weighting here as well
 
-
-def calculate_z(input_ht: hl.Table, obs: hl.expr.NumericExpression, exp: hl.expr.NumericExpression, output: str = 'z_raw') -> hl.Table:
-    '''get significance of a constraint finding'''
-    ht = input_ht.select(_obs=obs, _exp=exp)
-    ht = ht.annotate(_chisq=(ht._obs - ht._exp) ** 2 / ht._exp)
-    return ht.select(**{output: hl.sqrt(ht._chisq) * hl.cond(ht._obs > ht._exp, -1, 1)})
-
-
-def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
-    '''calculate significance for all constraint findings in table'''
-
-    # Raw z scores from chi squared distribution
-    ht = ht.annotate(**calculate_z(ht, ht.obs_syn, ht.exp_syn, 'syn_z_raw')[ht.key])
-    ht = ht.annotate(**calculate_z(ht, ht.obs_mis, ht.exp_mis, 'mis_z_raw')[ht.key])
-    ht = ht.annotate(**calculate_z(ht, ht.obs_lof, ht.exp_lof, 'lof_z_raw')[ht.key])
-    ht = ht.annotate(**calculate_z(ht, ht.obs_mis_pphen, ht.exp_mis_pphen, 'mis_pphen_z_raw')[ht.key])
-    ht = ht.annotate(**calculate_z(ht, ht.obs_mis_non_pphen, ht.exp_mis_non_pphen, 'mis_non_pphen_z_raw')[ht.key])
-    reasons = hl.empty_set(hl.tstr)
-    reasons = hl.cond(hl.or_else(ht.obs_syn, 0) + hl.or_else(ht.obs_mis, 0) + hl.or_else(ht.obs_lof, 0) == 0, reasons.add('no_variants'), reasons)
-    reasons = hl.cond(ht.exp_syn > 0, reasons, reasons.add('no_exp_syn'), missing_false=True)
-    reasons = hl.cond(ht.exp_mis > 0, reasons, reasons.add('no_exp_mis'), missing_false=True)
-    reasons = hl.cond(ht.exp_lof > 0, reasons, reasons.add('no_exp_lof'), missing_false=True)
-    reasons = hl.cond(hl.abs(ht.syn_z_raw) > 5, reasons.add('syn_outlier'), reasons, missing_false=True)
-    reasons = hl.cond(ht.mis_z_raw < -5, reasons.add('mis_too_many'), reasons, missing_false=True)
-    reasons = hl.cond(ht.lof_z_raw < -5, reasons.add('lof_too_many'), reasons, missing_false=True)
-    ht = ht.annotate(constraint_flag=reasons)
-    sds = ht.aggregate(hl.struct(
-        syn_sd=hl.agg.filter(
-            ~ht.constraint_flag.contains('no_variants') &
-            ~ht.constraint_flag.contains('syn_outlier') &
-            ~ht.constraint_flag.contains('no_exp_syn') &
-            hl.is_defined(ht.syn_z_raw),
-            hl.agg.stats(ht.syn_z_raw)).stdev,
-        mis_sd=hl.agg.filter(
-            ~ht.constraint_flag.contains('no_variants') &
-            ~ht.constraint_flag.contains('mis_outlier') &
-            ~ht.constraint_flag.contains('no_exp_mis') &
-            hl.is_defined(ht.mis_z_raw) & (ht.mis_z_raw < 0),
-            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_z_raw, -ht.mis_z_raw])
-        ).stdev,
-        lof_sd=hl.agg.filter(
-            ~ht.constraint_flag.contains('no_variants') &
-            ~ht.constraint_flag.contains('lof_outlier') &
-            ~ht.constraint_flag.contains('no_exp_lof') &
-            hl.is_defined(ht.lof_z_raw) & (ht.lof_z_raw < 0),
-            hl.agg.explode(lambda x: hl.agg.stats(x), [ht.lof_z_raw, -ht.lof_z_raw])
-        ).stdev,
-        # mis_pphen_sd=hl.agg.filter(
-        #     ~ht.constraint_flag.contains('no_variants') &
-        #     ~ht.constraint_flag.contains('mis_outlier') &
-        #     ~ht.constraint_flag.contains('no_exp_mis') &
-        #     hl.is_defined(ht.mis_pphen_z_raw) & (ht.mis_pphen_z_raw < 0),
-        #     hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_pphen_z_raw, -ht.mis_pphen_z_raw])
-        # ).stdev,
-        # mis_non_pphen_sd=hl.agg.filter(
-        #     ~ht.constraint_flag.contains('no_variants') &
-        #     ~ht.constraint_flag.contains('mis_outlier') &
-        #     ~ht.constraint_flag.contains('no_exp_mis') &
-        #     hl.is_defined(ht.mis_non_pphen_z_raw) & (ht.mis_non_pphen_z_raw < 0),
-        #     hl.agg.explode(lambda x: hl.agg.stats(x), [ht.mis_non_pphen_z_raw, -ht.mis_non_pphen_z_raw])
-        # ).stdev
-    ))
-    print(sds)
-    ht = ht.annotate_globals(**sds)
-    # ht_z = ht.transmute(
-    #     syn_z=ht.syn_z_raw / sds.syn_sd,
-    #     mis_z=ht.mis_z_raw / sds.mis_sd,
-    #     lof_z=ht.lof_z_raw / sds.lof_sd,
-    #     #mis_pphen_z=ht.mis_pphen_z_raw / sds.mis_pphen_sd,
-    #     #mis_non_pphen_z=ht.mis_non_pphen_z_raw / sds.mis_non_pphen_sd
-    # )
-    return ht_z
+    return coverage_model, plateau_models
 
 
 def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 'canonical'),
@@ -331,7 +294,9 @@ def main(args):
         run_tests(ht)
 
     if args.get_proportion_observed:
-
+        # Build a model for methylation-dependent mutation rate and apply it to get proportion of variants observed
+        # Refactor this code to be more functional across autosomes, x and y 
+        # Also need to incorporate genomes and v3 if possible
         full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers)
        #full_genome_ht = prepare_ht(hl.read_table(processed_genomes_ht_path), args.trimers)
         full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers)
@@ -425,6 +390,7 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--test', help='Run tests without actually requesting data',action='store_true')
     parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
+    parser.add_argument('--trimers', help='Use trimers instead of heptamers', action='store_true')
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
     parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now)', default='standard')
     parser.add_argument('--skip_af_filter_upfront', help='Skip AF filter up front (to be applied later to ensure that it is not affecting population-specific constraint): not generally recommended', action='store_true')
