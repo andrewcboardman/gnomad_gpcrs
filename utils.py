@@ -372,3 +372,33 @@ def calculate_all_z_scores(ht: hl.Table) -> hl.Table:
     #     #mis_non_pphen_z=ht.mis_non_pphen_z_raw / sds.mis_non_pphen_sd
     # )
     return ht_z
+
+def load_or_import_po(path, overwrite):
+    # Specify input format to avoid coercion to string
+    types = {
+        'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_global': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_global': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_afr': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_afr': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_afr': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_amr': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_amr': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_amr': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_eas': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_eas': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_eas': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_nfe': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_nfe': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_nfe': hl.expr.types.tarray(hl.tint32),
+        'adjusted_mutation_rate_sas': hl.expr.types.tarray(hl.tfloat64),
+        'expected_variants_sas': hl.expr.types.tarray(hl.tfloat64),
+        'downsampling_counts_sas': hl.expr.types.tarray(hl.tint32)
+        }
+
+    if os.path.isdir(path) and not overwrite:
+            ht = hl.read_table(path)
+    else:
+        ht = hl.import_table(path.replace('.ht','.txt.bgz'),impute=True,types=types)
+        ht.write(path,overwrite)
+    return ht

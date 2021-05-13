@@ -14,29 +14,21 @@ from .utils import *
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 HIGH_COVERAGE_CUTOFF = 40
 
-def filter_exomes(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table,
-                plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
-                recompute_possible: bool = False, remove_from_denominator: bool = True,
-                custom_model: str = None, dataset: str = 'gnomad',
-                impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> Tuple[hl.Table, List]:
+def prepare_exomes(exome_ht: hl.Table, groupings: List, impose_high_af_cutoff_upfront: bool = True) -> hl.Table:
 
+    # Manipulate VEP annotations and explode by them
     exome_ht = add_most_severe_csq_to_tc_within_ht(exome_ht)
-    context_ht = add_most_severe_csq_to_tc_within_ht(context_ht)
-    context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
-    context_ht = context_ht.explode(context_ht.transcript_consequences)
     exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
     exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
-
-    context_ht, _ = annotate_constraint_groupings(context_ht, custom_model=custom_model)
-    exome_ht, grouping = annotate_constraint_groupings(exome_ht, custom_model=custom_model)
-
-    context_ht = context_ht.filter(hl.is_defined(context_ht.exome_coverage)).select(
-        'context', 'ref', 'alt', 'methylation_level', *grouping)
+    
+    # Annotate variants with grouping variables. 
+    exome_ht, grouping = annotate_constraint_groupings(exome_ht,groupings) # This function needs to be adapted
     exome_ht = exome_ht.select(
-        'context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)
+        'context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *groupings)
 
+    # Filter by allele count
+    # Likely to need to adapt this function as well
     af_cutoff = 0.001
-
     freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
 
     def keep_criteria(ht):
@@ -46,30 +38,24 @@ def filter_exomes(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Tabl
         return crit
 
     exome_ht = exome_ht.filter(keep_criteria(exome_ht))
-    return exome_ht, grouping
+    return exome_ht
 
 
-def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table, possible_variants_ht: hl.Table,
-                plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
-                recompute_possible: bool = False, remove_from_denominator: bool = True,
-                custom_model: str = None, dataset: str = 'gnomad',
-                impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
+def get_proportion_observed(
+        exome_ht: hl.Table, 
+        possible_variants_ht: hl.Table,
+        groupings: List
+        dataset: str = 'gnomad', impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
      '''Filter exomes and aggregate by grouping variables'''
 
-    # Do filtering and get grouping variables, this code could be simplified
-    exome_ht, grouping = filter_exomes(exome_ht, context_ht, mutation_ht, plateau_models, coverage_model)
+    # Filter variant table and annotate with grouping variables
+    exome_ht = prepare_exomes(exome_ht, groupings)
     
     # Aggregate on grouping variables
-    ht = count_variants(exome_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True,
+    # Should probably adapt this function
+    ht = count_variants(exome_ht, additional_grouping=groupings, partition_hint=2000, force_grouping=True,
                         count_downsamplings=POPS, impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront)
     ht = ht.join(possible_variants_ht, 'outer')
-
-    # Save counts for grouping variable
-    ht.write(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht', True)
-    ht = hl.read_table(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht')
-    grouping.remove('coverage')
-
-    # Aggregate by gene symbol
     agg_expr = {
         'variant_count': hl.agg.sum(ht.variant_count),
         'adjusted_mutation_rate': hl.agg.sum(ht.adjusted_mutation_rate),
@@ -84,42 +70,10 @@ def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_h
     ht = ht.group_by(*grouping).partition_hint(1000).aggregate(**agg_expr)
     return ht.annotate(obs_exp=ht.variant_count / ht.expected_variants)
 
-def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False,
-                 ) -> Tuple[Tuple[float, float], Dict[str, Tuple[float, float]]]:
-    keys = ['context', 'ref', 'alt', 'methylation_level', 'mu_snp']
-
-    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
-    all_high_coverage_ht = coverage_ht.filter(coverage_ht.exome_coverage >= cov_cutoff)
-    agg_expr = {
-        'observed_variants': hl.agg.sum(all_high_coverage_ht.variant_count),
-        'possible_variants': hl.agg.sum(all_high_coverage_ht.possible_variants)
-    }
-    for pop in POPS:
-        agg_expr[f'observed_{pop}'] = hl.agg.array_sum(all_high_coverage_ht[f'downsampling_counts_{pop}'])
-    high_coverage_ht = all_high_coverage_ht.group_by(*keys).aggregate(**agg_expr)
-
-    high_coverage_ht = annotate_variant_types(high_coverage_ht, not trimers)
-    plateau_models = build_plateau_models_pop(high_coverage_ht, weighted=weighted)
-
-    high_coverage_scale_factor = all_high_coverage_ht.aggregate(
-        hl.agg.sum(all_high_coverage_ht.variant_count) /
-        hl.agg.sum(all_high_coverage_ht.possible_variants * all_high_coverage_ht.mu_snp))
-
-    all_low_coverage_ht = coverage_ht.filter((coverage_ht.exome_coverage < cov_cutoff) &
-                                             (coverage_ht.exome_coverage > 0))
-
-    low_coverage_ht = all_low_coverage_ht.group_by(log_coverage=hl.log10(all_low_coverage_ht.exome_coverage)).aggregate(
-        low_coverage_obs_exp=hl.agg.sum(all_low_coverage_ht.variant_count) /
-                             (high_coverage_scale_factor * hl.agg.sum(all_low_coverage_ht.possible_variants * all_low_coverage_ht.mu_snp)))
-    coverage_model = build_coverage_model(low_coverage_ht)
-    # TODO: consider weighting here as well
-
-    return coverage_model, plateau_models
-
-
 def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 'canonical'),
                      n_partitions: int = 1000) -> hl.Table:
     '''aggregate variants to calculate constraint metrics and significance'''
+    # Tidy this code a bit
     # This function aggregates over genes in all cases, as XG spans PAR and non-PAR X
     po_ht = po_ht.repartition(n_partitions).persist()
 
@@ -207,6 +161,8 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         **mis_non_pphen_cis[ht.key]
         )
     # Calculate significance
+    # Z score calculation not feasible with partial dataset
+    # Need to include flagging of issues in constraint calculations
     #ht = calculate_all_z_scores(ht)
     return ht
 
@@ -214,36 +170,6 @@ def run_tests(ht):
     """Tests loading of autosome po table"""
     # Incorporate more tests to check that aggregation by new variant annotations is legit
     ht.show()
-
-def load_or_import_po(path, overwrite):
-    # Specify input format to avoid coercion to string
-    types = {
-        'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_global': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_global': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_afr': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_afr': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_afr': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_amr': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_amr': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_amr': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_eas': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_eas': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_eas': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_nfe': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_nfe': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_nfe': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_sas': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_sas': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_sas': hl.expr.types.tarray(hl.tint32)
-        }
-
-    if os.path.isdir(path) and not overwrite:
-            ht = hl.read_table(path)
-    else:
-        ht = hl.import_table(path.replace('.ht','.txt.bgz'),impute=True,types=types)
-        ht.write(path,overwrite)
-    return ht
 
 def main(args):
     # Set paths for data access based on command line parameters
@@ -257,9 +183,8 @@ def main(args):
     po_ht_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'
     raw_constraint_ht_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
-    possible_file = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht'
+    possible_variants_ht_path = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht'
     
-    possible_variants_ht = hl.read_table(possible_file)
 
     po_output_path = po_ht_path.format(subdir=args.model)
     output_path = raw_constraint_ht_path.format(subdir=args.model)
@@ -278,78 +203,47 @@ def main(args):
 
     if args.get_proportion_observed:
         # Build a model for methylation-dependent mutation rate and apply it to get proportion of variants observed
-        # Refactor this code to be more functional across autosomes, x and y 
         # Also need to incorporate genomes and v3 if possible
 
+        print('Running aggregation of variants by grouping variables')
         # Tables of observed mutations in exomes
-        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers)     
+        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers) 
+
+        # filter into X, Y and autosomal regions
         exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
         exome_x_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('X')])
         exome_x_ht = exome_x_ht.filter(exome_x_ht.locus.in_x_nonpar())
         exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
         exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
 
-        #full_genome_ht = prepare_ht(hl.read_table(processed_genomes_ht_path), args.trimers)
-        #genome_ht = full_genome_ht.filter(full_genome_ht.locus.in_autosome_or_par())
+        # Modelling results of estimated mutation rates for genes, coverage, methylation level and base context
+        possible_variants_ht = hl.read_table(possible_variants_ht_path)
 
-        # Tables of context for each site
-        full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers)
-        context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
-        context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
-        context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
-        context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
-        context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
+        # Set chosen groupings to aggregate on
+        groupings = ['gene','annotation','modifier']
 
-        # Table of mutation rate
-        mutation_ht = hl.read_table(mutation_rate_ht_path).select('mu_snp')
+        # Apply model; aggregate by chosen groupings & get proportion observed; write to file
+        po_exome_ht, po_exome_x_ht, po_exome_y_ht = \ 
+            [get_proportion_observed(ht, possible_variants_ht, groupings) for ht in (exome_ht, exome_x_ht, exome_y_ht)]
+        po_exome_ht.write(po_output_path, overwrite=args.overwrite)
+        po_exome_x_ht.write(po_output_path.replace('.ht', '_x.ht'), overwrite=args.overwrite)
+        po_exome_y_ht.write(po_output_path.replace('.ht', '_y.ht'), overwrite=args.overwrite)
 
-        # Get proportion observed by coverage tables
-        coverage_ht = hl.read_table(po_coverage_ht_path)
-        coverage_x_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_x.ht'))
-        coverage_y_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_y.ht'))
-
-        # Build models for mutation frequency based on context
-        coverage_model, plateau_models = build_models(coverage_ht, args.trimers, True)
-        _, plateau_x_models = build_models(coverage_x_ht, args.trimers, True)
-        _, plateau_y_models = build_models(coverage_y_ht, args.trimers, True)
-
-        # Apply model and get proportion observed for each grouping of mutations
-        get_proportion_observed(exome_ht, context_ht, mutation_ht, plateau_models,
-                                coverage_model, recompute_possible=True,
-                                custom_model=args.model, dataset=args.dataset,
-                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
-                                ).write(po_output_path, overwrite=args.overwrite)
-        hl.read_table(po_output_path).export(po_output_path.replace('.ht', '.txt.bgz'))
-        
-        get_proportion_observed(exome_x_ht, context_x_ht, mutation_ht, plateau_x_models,
-                                coverage_model, recompute_possible=True,
-                                custom_model=args.model, dataset=args.dataset,
-                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
-                                ).write(po_output_path.replace('.ht', '_x.ht'), overwrite=args.overwrite)
-        hl.read_table(po_output_path.replace('.ht', '_x.ht')).export(po_output_path.replace('.ht', '_x.txt.bgz'))
-
-        get_proportion_observed(exome_y_ht, context_y_ht, mutation_ht, plateau_y_models,
-                                coverage_model, recompute_possible=True,
-                                custom_model=args.model, dataset=args.dataset,
-                                impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
-                                ).write(po_output_path.replace('.ht', '_y.ht'), overwrite=args.overwrite)
-        hl.read_table(po_output_path.replace('.ht', '_y.ht')).export(po_output_path.replace('.ht', '_y.txt.bgz'))
-
+       
     if args.aggregate:
-        print('Running aggregation')
+        print('Running aggregation by gene')
         # read PO hail tables for autosomes, X and Y chromosomes and join them
         print(f'Reading hail table from {po_output_path}')
         # Autosomes
-        ht_autosomes = load_or_import(po_output_path, args.overwrite)
+        ht = load_or_import(po_output_path, args.overwrite)
         # X chromosome
         ht_x = load_or_import(po_output_path.replace('.ht','_x.ht'), args.overwrite)
         # Y chromosome
         ht_y = load_or_import(po_output_path.replace('.ht','_y.ht'), args.overwrite)
         # Combine into one table
-        ht = ht_autosomes.union(ht_x).union(ht_y)
+        ht = ht.union(ht_x).union(ht_y)
         # group by gene/transcript and calculate summary stats
-        if args.model != 'syn_canonical':
-            ht = finalize_dataset(ht, keys=MODEL_KEYS[args.model])
+        ht = finalize_dataset(ht, keys=MODEL_KEYS[args.model])
         # write hail table to output path
         ht.write(output_path, args.overwrite)
         hl.read_table(output_path).export(output_path.replace('.ht', '.txt.bgz'))
