@@ -14,47 +14,18 @@ from .utils import *
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 HIGH_COVERAGE_CUTOFF = 40
 
-
-
-def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table,
-                            plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
-                            recompute_possible: bool = False, remove_from_denominator: bool = True,
-                            custom_model: str = None, dataset: str = 'gnomad',
-                            impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
+def filter_exomes(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table,
+                plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
+                recompute_possible: bool = False, remove_from_denominator: bool = True,
+                custom_model: str = None, dataset: str = 'gnomad',
+                impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> Tuple[hl.Table, List]:
 
     exome_ht = add_most_severe_csq_to_tc_within_ht(exome_ht)
     context_ht = add_most_severe_csq_to_tc_within_ht(context_ht)
-
-    if custom_model == 'syn_canonical':
-        context_ht = take_one_annotation_from_tc_within_ht(fast_filter_vep(context_ht))
-        context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
-        exome_ht = take_one_annotation_from_tc_within_ht(fast_filter_vep(exome_ht))
-        exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
-    elif custom_model == 'worst_csq':
-        context_ht = process_consequences(context_ht)
-        context_ht = context_ht.transmute(worst_csq_by_gene=context_ht.vep.worst_csq_by_gene)
-        context_ht = context_ht.explode(context_ht.worst_csq_by_gene)
-        exome_ht = process_consequences(exome_ht)
-        exome_ht = exome_ht.transmute(worst_csq_by_gene=exome_ht.vep.worst_csq_by_gene)
-        exome_ht = exome_ht.explode(exome_ht.worst_csq_by_gene)
-    elif custom_model == 'tx_annotation':
-        tx_ht = load_tx_expression_data()
-        context_ht = context_ht.annotate(**tx_ht[context_ht.key])
-        context_ht = context_ht.explode(context_ht.tx_annotation)
-        tx_ht = load_tx_expression_data(context=False)
-        exome_ht = exome_ht.annotate(**tx_ht[exome_ht.key])
-        exome_ht = exome_ht.explode(exome_ht.tx_annotation)
-    elif custom_model == 'distance_to_splice':
-        context_ht = annotate_distance_to_splice(context_ht)
-        exome_ht = annotate_distance_to_splice(exome_ht)
-        # TODO:
-        # context_ht = context_ht.explode(context_ht.tx_annotation)
-        # exome_ht = exome_ht.explode(exome_ht.tx_annotation)
-    else:
-        context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
-        context_ht = context_ht.explode(context_ht.transcript_consequences)
-        exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
-        exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
+    context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)
+    context_ht = context_ht.explode(context_ht.transcript_consequences)
+    exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
+    exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
 
     context_ht, _ = annotate_constraint_groupings(context_ht, custom_model=custom_model)
     exome_ht, grouping = annotate_constraint_groupings(exome_ht, custom_model=custom_model)
@@ -74,22 +45,31 @@ def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_h
             crit &= (ht.freq[freq_index].AF <= af_cutoff)
         return crit
 
-    exome_join = exome_ht[context_ht.key]
-    if remove_from_denominator:
-        context_ht = context_ht.filter(hl.is_missing(exome_join) | keep_criteria(exome_join))
-
     exome_ht = exome_ht.filter(keep_criteria(exome_ht))
+    return exome_ht, grouping
 
-    possible_file = f'{root}/model/possible_data/possible_transcript_pop_{custom_model}.ht'
-    possible_variants_ht = hl.read_table(possible_file)
 
+def get_proportion_observed(exome_ht: hl.Table, context_ht: hl.Table, mutation_ht: hl.Table, possible_variants_ht: hl.Table,
+                plateau_models: Dict[str, Tuple[float, float]], coverage_model: Tuple[float, float],
+                recompute_possible: bool = False, remove_from_denominator: bool = True,
+                custom_model: str = None, dataset: str = 'gnomad',
+                impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
+     '''Filter exomes and aggregate by grouping variables'''
+
+    # Do filtering and get grouping variables, this code could be simplified
+    exome_ht, grouping = filter_exomes(exome_ht, context_ht, mutation_ht, plateau_models, coverage_model)
+    
+    # Aggregate on grouping variables
     ht = count_variants(exome_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True,
                         count_downsamplings=POPS, impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront)
     ht = ht.join(possible_variants_ht, 'outer')
+
+    # Save counts for grouping variable
     ht.write(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht', True)
     ht = hl.read_table(f'{root}/model/possible_data/all_data_transcript_pop_{custom_model}.ht')
-
     grouping.remove('coverage')
+
+    # Aggregate by gene symbol
     agg_expr = {
         'variant_count': hl.agg.sum(ht.variant_count),
         'adjusted_mutation_rate': hl.agg.sum(ht.adjusted_mutation_rate),
@@ -235,7 +215,7 @@ def run_tests(ht):
     # Incorporate more tests to check that aggregation by new variant annotations is legit
     ht.show()
 
-def load_or_import(path, overwrite):
+def load_or_import_po(path, overwrite):
     # Specify input format to avoid coercion to string
     types = {
         'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
@@ -277,6 +257,9 @@ def main(args):
     po_ht_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'
     raw_constraint_ht_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
+    possible_file = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht'
+    
+    possible_variants_ht = hl.read_table(possible_file)
 
     po_output_path = po_ht_path.format(subdir=args.model)
     output_path = raw_constraint_ht_path.format(subdir=args.model)
@@ -290,35 +273,37 @@ def main(args):
     }
     
     if args.test:
-        ht = load_or_import(po_output_path, args.overwrite)
+        ht = load_or_import_po(po_output_path, args.overwrite)
         run_tests(ht)
 
     if args.get_proportion_observed:
         # Build a model for methylation-dependent mutation rate and apply it to get proportion of variants observed
         # Refactor this code to be more functional across autosomes, x and y 
         # Also need to incorporate genomes and v3 if possible
-        full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers)
-       #full_genome_ht = prepare_ht(hl.read_table(processed_genomes_ht_path), args.trimers)
-        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers)
 
-        context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
-        #genome_ht = full_genome_ht.filter(full_genome_ht.locus.in_autosome_or_par())
+        # Tables of observed mutations in exomes
+        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers)     
         exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
-
-        context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
-        context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
-        context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
-        context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
-
         exome_x_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('X')])
         exome_x_ht = exome_x_ht.filter(exome_x_ht.locus.in_x_nonpar())
         exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
         exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
 
-        # mutation rate
+        #full_genome_ht = prepare_ht(hl.read_table(processed_genomes_ht_path), args.trimers)
+        #genome_ht = full_genome_ht.filter(full_genome_ht.locus.in_autosome_or_par())
+
+        # Tables of context for each site
+        full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers)
+        context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
+        context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
+        context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
+        context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
+        context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
+
+        # Table of mutation rate
         mutation_ht = hl.read_table(mutation_rate_ht_path).select('mu_snp')
 
-        # Get proportion observed tables
+        # Get proportion observed by coverage tables
         coverage_ht = hl.read_table(po_coverage_ht_path)
         coverage_x_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_x.ht'))
         coverage_y_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_y.ht'))
@@ -328,13 +313,14 @@ def main(args):
         _, plateau_x_models = build_models(coverage_x_ht, args.trimers, True)
         _, plateau_y_models = build_models(coverage_y_ht, args.trimers, True)
 
+        # Apply model and get proportion observed for each grouping of mutations
         get_proportion_observed(exome_ht, context_ht, mutation_ht, plateau_models,
                                 coverage_model, recompute_possible=True,
                                 custom_model=args.model, dataset=args.dataset,
                                 impose_high_af_cutoff_upfront=not args.skip_af_filter_upfront
                                 ).write(po_output_path, overwrite=args.overwrite)
         hl.read_table(po_output_path).export(po_output_path.replace('.ht', '.txt.bgz'))
-
+        
         get_proportion_observed(exome_x_ht, context_x_ht, mutation_ht, plateau_x_models,
                                 coverage_model, recompute_possible=True,
                                 custom_model=args.model, dataset=args.dataset,
