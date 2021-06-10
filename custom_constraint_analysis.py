@@ -1,18 +1,34 @@
 #!/usr/bin/env python3
 import argparse
-import os
-import pickle
-import copy
-import uuid
+
 from itertools import product
 import hail as hl
 from typing import Dict, List, Optional, Set, Tuple
 from gnomad.utils.vep import *
-from .utils import *
+import hail as hl
+import argparse
+from itertools import product
+import hail as hl
+from typing import Dict, List, Optional, Set, Tuple, Any
+from gnomad_pipeline.utils import *
 
 # set pops
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 HIGH_COVERAGE_CUTOFF = 40
+
+def preprocess_exomes_and_genomes():
+    '''Add context, coverage and methylation data to genome and exome hail tables'''
+    # This is not ready yet; 
+    # context, coverage and methylation data are too large to download
+    # URLs stored here for the moment; need to access these on cloud and filter for required genes
+    # gs://gcp-public-data--gnomad/release/2.1/coverage/genomes/gnomad.genomes.r2.1.coverage.ht
+    # gs://gnomad-public/resources/grch37/methylation_sites/methylation.ht
+    # gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/
+    split_context_mt(vep_context_ht_path, {'exomes': coverage_ht_path('exomes'), 'genomes': coverage_ht_path('genomes')},
+                         methylation_sites_ht_path(), context_ht_path, args.overwrite)
+    pre_process_data(get_gnomad_public_data('genomes'), context_ht_path, processed_genomes_ht_path, args.overwrite)
+    pre_process_data(get_gnomad_public_data('exomes'), context_ht_path, processed_exomes_ht_path, args.overwrite)
+
 
 def prepare_exomes(exome_ht: hl.Table, groupings: List, impose_high_af_cutoff_upfront: bool = True) -> hl.Table:
 
@@ -44,14 +60,14 @@ def prepare_exomes(exome_ht: hl.Table, groupings: List, impose_high_af_cutoff_up
 def get_proportion_observed(
         exome_ht: hl.Table, 
         possible_variants_ht: hl.Table,
-        groupings: List
-        dataset: str = 'gnomad', impose_high_af_cutoff_upfront: bool = True, half_cutoff = False) -> hl.Table:
-     '''Filter exomes and aggregate by grouping variables'''
-
+        groupings: List,
+        dataset: str = 'gnomad', 
+        impose_high_af_cutoff_upfront: bool = True, 
+        half_cutoff = False) -> hl.Table:
+    '''Filter exomes and aggregate by grouping variables'''
     # Filter variant table and annotate with grouping variables
-    exome_ht = prepare_exomes(exome_ht, groupings)
-    
-    # Aggregate on grouping variables
+    exome_ht = prepare_exomes(exome_ht, groupings)  
+    # Aggregate on grouping variables    
     # Should probably adapt this function
     ht = count_variants(exome_ht, additional_grouping=groupings, partition_hint=2000, force_grouping=True,
                         count_downsamplings=POPS, impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront)
@@ -169,6 +185,7 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
 def run_tests(ht):
     """Tests loading of autosome po table"""
     # Incorporate more tests to check that aggregation by new variant annotations is legit
+    ht = prepare_ht(ht)
     ht.show()
 
 def main(args):
@@ -185,6 +202,7 @@ def main(args):
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
     possible_variants_ht_path = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht'
     
+    variants_table_path = f'{root}/gnomad_v2.1.1_gpcr_variants_unfiltered.tsv'
 
     po_output_path = po_ht_path.format(subdir=args.model)
     output_path = raw_constraint_ht_path.format(subdir=args.model)
@@ -198,7 +216,7 @@ def main(args):
     }
     
     if args.test:
-        ht = load_or_import_po(po_output_path, args.overwrite)
+        ht = load_variant_table(variants_table_path)
         run_tests(ht)
 
     if args.get_proportion_observed:
@@ -207,7 +225,8 @@ def main(args):
 
         print('Running aggregation of variants by grouping variables')
         # Tables of observed mutations in exomes
-        full_exome_ht = prepare_ht(hl.read_table(processed_exomes_ht_path), args.trimers) 
+        full_exome_ht = hl.read_table(processed_exomes_ht_path)
+        full_exome_ht = prepare_ht(full_exome_ht, args.trimers) 
 
         # filter into X, Y and autosomal regions
         exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
@@ -223,7 +242,7 @@ def main(args):
         groupings = ['gene','annotation','modifier']
 
         # Apply model; aggregate by chosen groupings & get proportion observed; write to file
-        po_exome_ht, po_exome_x_ht, po_exome_y_ht = \ 
+        po_exome_ht, po_exome_x_ht, po_exome_y_ht = \
             [get_proportion_observed(ht, possible_variants_ht, groupings) for ht in (exome_ht, exome_x_ht, exome_y_ht)]
         po_exome_ht.write(po_output_path, overwrite=args.overwrite)
         po_exome_x_ht.write(po_output_path.replace('.ht', '_x.ht'), overwrite=args.overwrite)
@@ -274,7 +293,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
     parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now)', default='standard')
     parser.add_argument('--skip_af_filter_upfront', help='Skip AF filter up front (to be applied later to ensure that it is not affecting population-specific constraint): not generally recommended', action='store_true')
-    parser.add_argument('--apply_model',help='Apply model to calculate proportion observed')
+    parser.add_argument('--get_proportion_observed',help='Apply model to calculate proportion observed')
     parser.add_argument('--aggregate', help='Aggregate p_obs table', action='store_true')
     parser.add_argument('--summarise', help='Report summary stats', action='store_true')
     args = parser.parse_args()
