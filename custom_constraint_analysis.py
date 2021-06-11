@@ -21,9 +21,11 @@ def preprocess_exomes_and_genomes():
     # This is not ready yet; 
     # context, coverage and methylation data are too large to download
     # URLs stored here for the moment; need to access these on cloud and filter for required genes
-    # gs://gcp-public-data--gnomad/release/2.1/coverage/genomes/gnomad.genomes.r2.1.coverage.ht
-    # gs://gnomad-public/resources/grch37/methylation_sites/methylation.ht
-    # gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/
+    exomes_path = 'gs://gcp-public-data--gnomad/release/2.1/ht/exomes/gnomad.exomes.r2.1.sites.ht/'
+    coverage_path_exomes = 'gs://gcp-public-data--gnomad/release/2.1/coverage/exomes/gnomad.exomes.r2.1.coverage.ht'
+    context_path_vep = 'gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/'
+    methylation_path = 'gs://gnomad-public/resources/grch37/methylation_sites/methylation.ht'
+
     split_context_mt(vep_context_ht_path, {'exomes': coverage_ht_path('exomes'), 'genomes': coverage_ht_path('genomes')},
                          methylation_sites_ht_path(), context_ht_path, args.overwrite)
     pre_process_data(get_gnomad_public_data('genomes'), context_ht_path, processed_genomes_ht_path, args.overwrite)
