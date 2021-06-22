@@ -9,10 +9,49 @@ from itertools import product
 import hail as hl
 from typing import Dict, List, Optional, Set, Tuple, Any
 
-# Pre-process gnomad release data with context, coverage and methylation data
+def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_snp',
+                     keys: Tuple[str] = ('context', 'ref', 'alt', 'methylation_level')) -> hl.Table:
+    mu = hl.literal(mutation_ht.aggregate(hl.dict(hl.agg.collect(
+        (hl.struct(**{k: mutation_ht[k] for k in keys}), mutation_ht.mu_snp)))))
+    mu = mu.get(hl.struct(**{k: ht[k] for k in keys}))
+    return ht.annotate(**{output_loc: hl.case().when(hl.is_defined(mu), mu).or_error('Missing mu')})
 
+def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False,
+                 ) -> Tuple[Tuple[float, float], Dict[str, Tuple[float, float]]]:
+    keys = ['context', 'ref', 'alt', 'methylation_level', 'mu_snp']
+
+    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
+    all_high_coverage_ht = coverage_ht.filter(coverage_ht.exome_coverage >= cov_cutoff)
+    agg_expr = {
+        'observed_variants': hl.agg.sum(all_high_coverage_ht.variant_count),
+        'possible_variants': hl.agg.sum(all_high_coverage_ht.possible_variants)
+    }
+    for pop in POPS:
+        agg_expr[f'observed_{pop}'] = hl.agg.array_sum(all_high_coverage_ht[f'downsampling_counts_{pop}'])
+    high_coverage_ht = all_high_coverage_ht.group_by(*keys).aggregate(**agg_expr)
+
+    high_coverage_ht = annotate_variant_types(high_coverage_ht, not trimers)
+    plateau_models = build_plateau_models_pop(high_coverage_ht, weighted=weighted)
+
+    high_coverage_scale_factor = all_high_coverage_ht.aggregate(
+        hl.agg.sum(all_high_coverage_ht.variant_count) /
+        hl.agg.sum(all_high_coverage_ht.possible_variants * all_high_coverage_ht.mu_snp))
+
+    all_low_coverage_ht = coverage_ht.filter((coverage_ht.exome_coverage < cov_cutoff) &
+                                             (coverage_ht.exome_coverage > 0))
+
+    low_coverage_ht = all_low_coverage_ht.group_by(log_coverage=hl.log10(all_low_coverage_ht.exome_coverage)).aggregate(
+        low_coverage_obs_exp=hl.agg.sum(all_low_coverage_ht.variant_count) /
+                             (high_coverage_scale_factor * hl.agg.sum(all_low_coverage_ht.possible_variants * all_low_coverage_ht.mu_snp)))
+    coverage_model = build_coverage_model(low_coverage_ht)
+    # TODO: consider weighting here as well
+
+    return coverage_model, plateau_models
+
+    
 def split_context_mt(raw_context_ht_path: str, coverage_ht_paths: Dict[str, str], methylation_ht_path: str,
                      context_ht_path: str, overwrite: bool = False) -> None:
+    '''Pre-process gnomad release data with context, coverage and methylation data'''
     raw_context_ht = hl.split_multi_hts(hl.read_table(raw_context_ht_path))
     raw_context_ht.write(f'{raw_context_ht_path}.temp_split.ht', overwrite)
     raw_context_ht = hl.read_table(f'{raw_context_ht_path}.temp_split.ht')
