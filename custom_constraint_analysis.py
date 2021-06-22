@@ -33,21 +33,31 @@ def get_exomes(exomes_path, genes, gene_intervals):
     # limit to first 100 rows for now
     full_exome_ht.head(100)
     # Select relevant columns to avoid getting too much data 
-    exome_ht = full_exome_ht.select(
+    full_exome_ht = full_exome_ht.select(
         full_exome_ht.freq,
-        full_exome_ht.vep.transcript_consequences
+        full_exome_ht.vep.transcript_consequences,
+        full_exome_ht.context,
+        full_exome_ht.methylation,
+        full_exome_ht.coverage
     )
     # Filter by gene
-    selected_exomes_ht = hl.filter_intervals(exome_ht, gene_intervals)
+    exome_ht = hl.filter_intervals(full_exome_ht, gene_intervals)
     # Prepare exomes
-    selected_exomes_ht = prepare_ht(selected_exomes_ht)
-    return selected_exomes_ht
+    exome_ht = prepare_ht(exome_ht)
+    return exome_ht
 
 
 def get_context(context_ht_path, gene_intervals):
-    full_context_ht = prepare_ht(hl.read_table(context_ht_path), args.trimers).head(5)
+    full_context_ht = hl.read_table(context_ht_path).head(5)
+    full_context_ht = full_context_ht.select(
+        full_context_ht.vep.transcript_consequences,
+        full_context_ht.context,
+        full_context_ht.methylation,
+        full_context_ht.coverage
+    )
     # Filter this table in similar way to exomes ht
     selected_context_ht = hl.filter_intervals(full_context_ht,gene_intervals)
+    selected_context_ht = prepare_ht(selected_context_ht)
     return selected_context_ht
 
 
@@ -57,8 +67,9 @@ def get_mutation_rate(mutation_rate_ht_path,gene_intervals):
     return mutation_rate_ht
 
 
-def prepare_for_modelling(
+def prepare_exomes_and_context(
         exome_ht: hl.Table,
+        context_ht: hl.Table,
         dataset: str = 'gnomad', 
         impose_high_af_cutoff_upfront: bool = True
     ) -> hl.Table:
@@ -70,14 +81,17 @@ def prepare_for_modelling(
     
     # Annotate variants with grouping variables. 
     # This seems to need some things that you don't have (ref, alt, methylation level, pass_filters)
-    exome_ht, groupings = annotate_constraint_groupings(exome_ht)
-    exome_ht = exome_ht.select('context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *groupings)
+    exome_ht, grouping = annotate_constraint_groupings(exome_ht)
+    exome_ht = exome_ht.select('context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)
 
+    # annotate and filter context table in same way. Exome coverage or genome coverage?
+    context_ht, grouping = annotate_constraint_groupings(context_ht)
     context_ht = context_ht.filter(hl.is_defined(context_ht.exome_coverage)).select(
         'context', 'ref', 'alt', 'methylation_level', *grouping)
 
     # Filter by allele count > 0, allele fraction < cutoff, coverage > 0
     # what does this code do? look at what you get from annotation
+    # Frankly could do this earlier
     af_cutoff = 0.001
     freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
     def keep_criteria(ht):
@@ -87,7 +101,7 @@ def prepare_for_modelling(
         return crit
     exome_ht = exome_ht.filter(keep_criteria(exome_ht))
 
-    return exome_ht
+    return exome_ht, context_ht, grouping
 
 
 def build_coverage_model(po_coverage_ht_path):
@@ -138,19 +152,26 @@ def get_possible_variants(context_ht,mutation_ht, coverage_model, plateau_models
 
 def get_proportion_observed(
         exome_ht: hl.Table, 
-        possible_variants_ht: hl.Table,
+        context_ht: hl.Table,
+        mutation_ht: hl.Table,
+        coverage_model, plateau_models,
+        possible_variants_ht_path,
         grouping: List,
         impose_high_af_cutoff_upfront: bool = True) -> hl.Table:
     '''Aggregate by grouping variables'''
+
+    # Get possible variants for this context table
+    possible_variants_ht = get_possible_variants(context_ht,mutation_ht, coverage_model, plateau_models, grouping, possible_variants_ht_path)
 
     # Count observed variants by grouping
     ht = count_variants(exome_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True,
                         count_downsamplings=False, impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront,
                         POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas'))
+
     # Match with expected frequency of variants by grouping
     ht = ht.join(possible_variants_ht, 'outer')
 
-    # Aggregate all groupings by 
+    # Aggregate all groupings across populations
     agg_expr = {
         'variant_count': hl.agg.sum(ht.variant_count),
         'adjusted_mutation_rate': hl.agg.sum(ht.adjusted_mutation_rate),
@@ -277,10 +298,8 @@ def main(args):
     POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas') # set pops
 
     # New paths to public access bucket
-    exomes_path = 'gs://gcp-public-data--gnomad/release/2.1/ht/exomes/gnomad.exomes.r2.1.sites.ht/'
-    coverage_path_exomes = 'gs://gcp-public-data--gnomad/release/2.1/coverage/exomes/gnomad.exomes.r2.1.coverage.ht'
+    exomes_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/exomes_processed.ht/'
     context_path_vep = 'gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/'
-    methylation_path = 'gs://gnomad-public/resources/grch37/methylation_sites/methylation.ht'
 
 
     root = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/'
@@ -321,16 +340,13 @@ def main(args):
         # Get intervals for chosen genes from Ensembl
         gene_intervals = get_gene_intervals()
         # Get relevant exomes, genomes, context and mutation rate data
-        exomes_ht = get_exomes(exomes_path, gene_intervals)
+        full_exome_ht = get_exomes(exomes_path, gene_intervals)
         # genomes_ht = get_genomes(processed_genomes_ht_path)
-        context_ht = get_context(context_path_vep,gene_intervals)
+        full_context_ht = get_context(context_path_vep,gene_intervals)
         mutation_rate_ht = get_mutation_rate(mutation_rate_ht_path,gene_intervals)
 
         # Get coverage table and build a model for methylation-dependent mutation rate
         coverage_model, plateau_models = build_coverage_model(po_coverage_ht_path)
-
-        print('Pre-processing variant data...')
-        full_exome_ht = prepare_ht(full_exome_ht, args.trimers) # what does this do? does it need the other tables?
 
         # filter into X, Y and autosomal regions
         exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
@@ -339,25 +355,31 @@ def main(args):
         exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
         exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
 
+        context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
+        context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
+        context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
+        context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
+        context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
+
         exome_ht.write(exomes_ht_path)
         exome_x_ht.write(exomes_x_ht_path)
         exome_y_ht.write(exomes_y_ht_path)
 
+        context_ht.write(contexts_ht_path)
+        context_x_ht.write(contexts_x_ht_path)
+        context_y_ht.write(contexts_y_ht_path)
+
     if args.aggregate:
         print('Running aggregation of variants by grouping variables')
-        # Set chosen groupings to aggregate on
-        groupings = ['gene','annotation','modifier']
-
-        # Filter variant table and annotate with grouping variables
-        exome_ht = prepare_exomes(exome_ht, groupings) # do this for X and Y?
-        
-        # Calculate possible variants
-        possible_variants_ht = get_possible_variants(groupings) # whatever is needed to do this
+        # Set chosen grouping variables to aggregate on
+        grouping = ['gene','annotation','modifier']
 
         # aggregate by chosen groupings & get proportion observed; write to file
-        po_exome_ht, po_exome_x_ht, po_exome_y_ht = \
-            [get_proportion_observed(ht, possible_variants_ht, groupings) # adjust to make up for lack of possible_variants \ 
-                for ht in (exome_ht, exome_x_ht, exome_y_ht)]
+        input_hts = zip((exome_ht, exome_x_ht, exome_y_ht), (context_ht, context_x_ht, context_y_ht))
+        output_hts = []
+        for exome_ht_, context_ht_ in input_hts:
+            output_hts.append(get_proportion_observed(exome_ht_,context_ht_,grouping))
+        po_exome_ht, po_exome_x_ht, po_exome_y_ht = output_hts
 
         # Write proportion observed to file        
         po_exome_ht.write(po_output_path, overwrite=args.overwrite)
