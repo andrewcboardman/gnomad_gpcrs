@@ -1,13 +1,11 @@
 from gnomad.utils.vep import *
 import hail as hl
-import argparse
 import os
-import pickle
 import copy
-import uuid
-from itertools import product
-import hail as hl
 from typing import Dict, List, Optional, Set, Tuple, Any
+
+HIGH_COVERAGE_CUTOFF = 40
+POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_snp',
                      keys: Tuple[str] = ('context', 'ref', 'alt', 'methylation_level')) -> hl.Table:
@@ -16,7 +14,9 @@ def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_
     mu = mu.get(hl.struct(**{k: ht[k] for k in keys}))
     return ht.annotate(**{output_loc: hl.case().when(hl.is_defined(mu), mu).or_error('Missing mu')})
 
-def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False,
+# Model building
+
+def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False
                  ) -> Tuple[Tuple[float, float], Dict[str, Tuple[float, float]]]:
     keys = ['context', 'ref', 'alt', 'methylation_level', 'mu_snp']
 
@@ -31,54 +31,82 @@ def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = 
     high_coverage_ht = all_high_coverage_ht.group_by(*keys).aggregate(**agg_expr)
 
     high_coverage_ht = annotate_variant_types(high_coverage_ht, not trimers)
-    plateau_models = build_plateau_models_pop(high_coverage_ht, weighted=weighted)
+    #plateau_models = build_plateau_models(high_coverage_ht)
+    plateau_models = build_plateau_models_pop(high_coverage_ht, weighted=weighted) 
 
     high_coverage_scale_factor = all_high_coverage_ht.aggregate(
         hl.agg.sum(all_high_coverage_ht.variant_count) /
         hl.agg.sum(all_high_coverage_ht.possible_variants * all_high_coverage_ht.mu_snp))
 
     all_low_coverage_ht = coverage_ht.filter((coverage_ht.exome_coverage < cov_cutoff) &
-                                             (coverage_ht.exome_coverage > 0))
+                                              (coverage_ht.exome_coverage > 0))
 
     low_coverage_ht = all_low_coverage_ht.group_by(log_coverage=hl.log10(all_low_coverage_ht.exome_coverage)).aggregate(
-        low_coverage_obs_exp=hl.agg.sum(all_low_coverage_ht.variant_count) /
-                             (high_coverage_scale_factor * hl.agg.sum(all_low_coverage_ht.possible_variants * all_low_coverage_ht.mu_snp)))
+         low_coverage_obs_exp=hl.agg.sum(all_low_coverage_ht.variant_count) /
+                              (high_coverage_scale_factor * hl.agg.sum(all_low_coverage_ht.possible_variants * all_low_coverage_ht.mu_snp)))
     coverage_model = build_coverage_model(low_coverage_ht)
-    # TODO: consider weighting here as well
+    # # TODO: consider weighting here as well
 
     return coverage_model, plateau_models
 
-    
-def split_context_mt(raw_context_ht_path: str, coverage_ht_paths: Dict[str, str], methylation_ht_path: str,
-                     context_ht_path: str, overwrite: bool = False) -> None:
-    '''Pre-process gnomad release data with context, coverage and methylation data'''
-    raw_context_ht = hl.split_multi_hts(hl.read_table(raw_context_ht_path))
-    raw_context_ht.write(f'{raw_context_ht_path}.temp_split.ht', overwrite)
-    raw_context_ht = hl.read_table(f'{raw_context_ht_path}.temp_split.ht')
-
-    coverage_hts = {loc: hl.read_table(coverage_ht_path) for loc, coverage_ht_path in coverage_ht_paths.items()}
-    coverage_hts = {loc: coverage_ht.drop('#chrom', 'pos') if '#chrom' in list(coverage_ht.row) else coverage_ht
-                    for loc, coverage_ht in coverage_hts.items()}
-    methylation_ht = hl.read_table(methylation_ht_path)
-    gerp_ht = hl.read_table(gerp_annotations_path)
-
-    raw_context_ht = raw_context_ht.annotate(
-        methylation=methylation_ht[raw_context_ht.locus],
-        coverage=hl.struct(**{loc: coverage_ht[raw_context_ht.locus] for loc, coverage_ht in coverage_hts.items()}),
-        gerp=gerp_ht[raw_context_ht.locus].S)
-
-    raw_context_ht.write(context_ht_path, overwrite)
+def build_coverage_model(coverage_ht: hl.Table) -> Tuple[float, float]:
+    """
+    Calibrates coverage model (returns intercept and slope)
+    """
+    return tuple(coverage_ht.aggregate(hl.agg.linreg(coverage_ht.low_coverage_obs_exp, [1, coverage_ht.log_coverage])).beta)
 
 
-def pre_process_data(ht: hl.Table, split_context_ht_path: str,
-                     output_ht_path: str, overwrite: bool = False) -> None:
-    context_ht = hl.read_table(split_context_ht_path).drop('a_index', 'was_split')
-    context_ht = context_ht.annotate(vep=context_ht.vep.drop('colocated_variants'))
-    ht.annotate(**context_ht[ht.key], pass_filters=hl.len(ht.filters) == 0).write(output_ht_path, overwrite)
+def build_plateau_models(ht: hl.Table, weighted: bool = False) -> Dict[str, Tuple[float, float]]:
+    """
+    Calibrates high coverage model (returns intercept and slope)
+    """
+    # TODO: try square weighting
 
-def load_variant_table(file):
-    ht = hl.import_table(file,impute=True)
+    ht = ht.annotate(high_coverage_proportion_observed=ht.observed_variants / ht.possible_variants)
+    ht.aggregate(hl.agg.group_by(ht.cpg,hl.agg.linreg(ht.high_coverage_proportion_observed, [1, ht.mu_snp])).map_values(lambda x: x.beta))
+                                                      #weight=ht.possible_variants if weighted else None)
+
     return ht
+                                        
+                                       
+def build_plateau_models_pop(ht: hl.Table, weighted: bool = False) -> Dict[str, Tuple[float, float]]:
+    """
+    Calibrates high coverage model (returns intercept and slope)
+    this is causing stack overflow
+    """
+   # pop_lengths = get_all_pop_lengths(ht)
+    agg_expr = {
+    #     pop: [hl.agg.group_by(ht.cpg,
+    #                          hl.agg.linreg(ht[f'observed_{pop}'][i] / ht.possible_variants, [1, ht.mu_snp]),
+    #                                        #weight=ht.possible_variants if weighted else None)
+    #                          ).map_values(lambda x: x.beta) for i in range(length)]
+    #     for length, pop in pop_lengths
+    }
+    agg_expr['total'] = hl.agg.group_by(ht.cpg,
+                                        hl.agg.linreg(ht.observed_variants / ht.possible_variants, [1, ht.mu_snp]),
+                                                    #  weight=ht.possible_variants if weighted else None)
+                                        ).map_values(lambda x: x.beta)
+    return  None #ht.aggregate(hl.struct(**agg_expr))
+
+
+def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
+    ds_lengths = ht.aggregate([hl.agg.min(hl.len(ht[f'{prefix}{pop}'])) for pop in pops])
+    # temp_ht = ht.take(1)[0]
+    # ds_lengths = [len(temp_ht[f'{prefix}{pop}']) for pop in pops]
+    pop_lengths = list(zip(ds_lengths, pops))
+    print('Found: ', pop_lengths)
+    if not skip_assertion:
+        assert ht.all(hl.all(lambda f: f, [hl.len(ht[f'{prefix}{pop}']) == length for length, pop in pop_lengths]))
+    return pop_lengths
+
+
+def get_downsamplings(ht):
+    freq_meta = ht.freq_meta.collect()[0]
+    downsamplings = [(i, int(x.get('downsampling'))) for i, x in enumerate(freq_meta)
+                     if x.get('group') == 'adj' and x.get('pop') == 'global'
+                     and x.get('downsampling') is not None]
+    return downsamplings
+    
 
 # Preparation of exomes table 
 

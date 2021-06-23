@@ -2,14 +2,11 @@
 
 import argparse
 from itertools import product
-import hail as hl
-from typing import Dict, List, Optional, Set, Tuple, Union
-#from gnomad.utils.vep import *
-import argparse
-from itertools import product
+import pickle
 from typing import Dict, List, Optional, Set, Tuple, Any
+import hail as hl
+import pandas as pd
 from gnomad_pipeline.utils import *
-
 
 # Summary of pipeline steps
 # Get gene list & parameters 
@@ -23,15 +20,18 @@ from gnomad_pipeline.utils import *
 # Calculate proportion of variants observed by category
 # Finalise and calculate summary stats for release
 
-def get_gene_intervals(genes):
-    # Amend this to use Ensembl gene intervals from file
-    return [hl.parse_locus_interval('1:START-50K')]
+def get_gene_intervals():
+    # Get Ensembl gene intervals from file
+    df_intervals = pd.read_csv('data/Ensembl_Grch37_gpcr_genome_locations.csv')
+    df_intervals = df_intervals[['HGNC symbol','Grch37 symbol','Grch37 chromosome','Grch37 start bp','Grch37 end bp']]
+    df_intervals['locus_interval_txt'] = df_intervals['Grch37 chromosome'] + ':'  + \
+        + df_intervals['Grch37 start bp'].map(str) + '-' + df_intervals['Grch37 end bp'].map(str)
+    return list(df_intervals['locus_interval_txt'].map(hl.parse_locus_interval))
 
-def get_exomes(exomes_path, genes, gene_intervals):
+
+def get_exomes(exomes_path, gene_intervals):
     # Path to full exome table
     full_exome_ht = hl.read_table(exomes_path)
-    # limit to first 100 rows for now
-    full_exome_ht.head(100)
     # Select relevant columns to avoid getting too much data 
     full_exome_ht = full_exome_ht.select(
         full_exome_ht.freq,
@@ -48,7 +48,7 @@ def get_exomes(exomes_path, genes, gene_intervals):
 
 
 def get_context(context_ht_path, gene_intervals):
-    full_context_ht = hl.read_table(context_ht_path).head(5)
+    full_context_ht = hl.read_table(context_ht_path)
     full_context_ht = full_context_ht.select(
         full_context_ht.vep.transcript_consequences,
         full_context_ht.context,
@@ -61,26 +61,19 @@ def get_context(context_ht_path, gene_intervals):
     return selected_context_ht
 
 
-def get_mutation_rate(mutation_rate_ht_path,gene_intervals):
-    mutation_rate_ht = hl.read_table(mutation_rate_ht_path).select('mu_snp').head(5)
-    # don't know whether i need to filter this table, take the head to be clear
-    return mutation_rate_ht
-
-
 def prepare_exomes_and_context(
         exome_ht: hl.Table,
         context_ht: hl.Table,
         dataset: str = 'gnomad', 
         impose_high_af_cutoff_upfront: bool = True
     ) -> hl.Table:
-    '''Prepare exome mutation data for modelling'''
-    # Manipulate VEP annotations and explode by them - why?
+    '''Prepare exome mutation data for modelling. Untested'''
+    # For standard analysis, assume the worst predicted transcript consequence takes place
     exome_ht = add_most_severe_csq_to_tc_within_ht(exome_ht)
     exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)
     exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
     
     # Annotate variants with grouping variables. 
-    # This seems to need some things that you don't have (ref, alt, methylation level, pass_filters)
     exome_ht, grouping = annotate_constraint_groupings(exome_ht)
     exome_ht = exome_ht.select('context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)
 
@@ -90,8 +83,6 @@ def prepare_exomes_and_context(
         'context', 'ref', 'alt', 'methylation_level', *grouping)
 
     # Filter by allele count > 0, allele fraction < cutoff, coverage > 0
-    # what does this code do? look at what you get from annotation
-    # Frankly could do this earlier
     af_cutoff = 0.001
     freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
     def keep_criteria(ht):
@@ -104,22 +95,9 @@ def prepare_exomes_and_context(
     return exome_ht, context_ht, grouping
 
 
-def build_coverage_model(po_coverage_ht_path):
-    '''Build linear regression model for coverage, not sure of function'''
-    coverage_ht = hl.read_table(po_coverage_ht_path)
-    coverage_x_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_x.ht'))
-    coverage_y_ht = hl.read_table(po_coverage_ht_path.replace('.ht', '_y.ht'))
-
-    coverage_model, plateau_models = build_models(coverage_ht, args.trimers, True) # Have not read this function
-    _, plateau_x_models = build_models(coverage_x_ht, args.trimers, True)
-    _, plateau_y_models = build_models(coverage_y_ht, args.trimers, True)
-
-    return coverage_model, plateau_models
-
-
 def get_possible_variants(context_ht,mutation_ht, coverage_model, plateau_models, grouping, possible_file,
         half_cutoff = False, HIGH_COVERAGE_CUTOFF = 40, POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')):
-    '''Compute table of possible variants with needed properties'''
+    '''Compute table of possible variants with needed properties. Untested'''
     ht = count_variants(context_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True)
     ht = annotate_with_mu(ht, mutation_ht)
     ht = ht.transmute(possible_variants=ht.variant_count)
@@ -283,13 +261,10 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
     # ht = calculate_all_z_scores(ht)
     return ht
 
-def run_tests(exomes_path):
+def run_tests(exomes_path, context_path, po_observed_by_coverage_path):
     """Tests loading of autosome po table"""
     print('Test access to exomes and filtering')
-    test_genes = ['ADRB1']
-    test_intervals = get_gene_intervals(test_genes)
-    ht_exomes_test = get_exomes(exomes_path, test_genes, test_intervals)
-    ht_exomes_test.show()
+  
 
     # Also need to test: storing in files and reloading, pre-processing, model usage, etc.
 
@@ -300,53 +275,52 @@ def main(args):
     # New paths to public access bucket
     exomes_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/exomes_processed.ht/'
     context_path_vep = 'gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/'
+    mutation_rate_ht_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/mutation_rate_methylation_bins.ht'
+    po_coverage_ht_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
 
-
-    root = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/'
+    # Paths for local storage
+    root = './data'
+    exomes_local_path = f'{root}/exomes.ht'
+    context_local_path = f'{root}/context.ht'
+    mutation_rate_local_path = f'{root}/context.ht'
+    po_coverage_local_path = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
     
-    processed_genomes_ht_path = f'{root}/model/genomes_processed.ht'
-    processed_exomes_ht_path = f'{root}/model/exomes_processed.ht'
-
-    coverage_autosomes = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
-    coverage_x = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins_x.ht/'
-    coverage_y = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins_y.ht/' 
-
-    mutation_rate_ht_path = f'{root}/model/mutation_rate_methylation_bins.ht'
-    po_coverage_ht_path = f'{root}/model/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
     po_ht_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'
     raw_constraint_ht_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'
     final_constraint_ht_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'
     possible_variants_ht_path = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht'
-    
-    variants_table_path = f'{root}/gnomad_v2.1.1_gpcr_variants_unfiltered.tsv'
 
     po_output_path = po_ht_path.format(subdir=args.model)
     output_path = raw_constraint_ht_path.format(subdir=args.model)
     final_path = final_constraint_ht_path.format(subdir=args.model)
 
-    # Sets method for aggregation, will need to be changed for custom analysis
-    MODEL_KEYS = {
-        'worst_csq': ['gene'],
-        'tx_annotation': ['gene', 'expressed'],
-        'standard': ['gene', 'transcript', 'canonical']
-    }
-    
+    hl.init(quiet=True)
     if args.test:
         # Currently tests whether it can read data from exomes sites table
-        run_tests(exomes_path)
+        #test_genes = ['ADRB1']
+        test_intervals = get_gene_intervals()
+        # print(test_intervals)
+        # ht_exomes_test = get_exomes(exomes_path, test_intervals)
+        # ht_exomes_test.show()
+        # ht_context_test = get_context(context_path,test_intervals)
+        # ht_context_test.show()
+       
+ 
+        coverage_ht = hl.read_table(po_coverage_local_path)
+        coverage_model, plateau_models = build_models(coverage_ht, args.trimers, True) 
+        with open('data/coverage_models.pkl','wb') as fid:
+            pickle.dump((coverage_model,plateau_models),fid)
+        
+        print('Ran coverage model building')
+
+        #run_tests(exomes_path,context_path_vep, po_coverage_local_path)
 
     if args.get_data:
-        print('Getting data from Google cloud...')
+        print('Getting data from Google Cloud...')
         # Get intervals for chosen genes from Ensembl
         gene_intervals = get_gene_intervals()
-        # Get relevant exomes, genomes, context and mutation rate data
+        # Get relevant exomes data 
         full_exome_ht = get_exomes(exomes_path, gene_intervals)
-        # genomes_ht = get_genomes(processed_genomes_ht_path)
-        full_context_ht = get_context(context_path_vep,gene_intervals)
-        mutation_rate_ht = get_mutation_rate(mutation_rate_ht_path,gene_intervals)
-
-        # Get coverage table and build a model for methylation-dependent mutation rate
-        coverage_model, plateau_models = build_coverage_model(po_coverage_ht_path)
 
         # filter into X, Y and autosomal regions
         exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
@@ -354,20 +328,33 @@ def main(args):
         exome_x_ht = exome_x_ht.filter(exome_x_ht.locus.in_x_nonpar())
         exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
         exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
+        exome_ht.write(exomes_local_path,overwrite=args.overwrite)
+        exome_x_ht.write(exomes_local_path.replace('.ht', '_x.ht'),overwrite=args.overwrite)
+        exome_y_ht.write(exomes_local_path.replace('.ht', '_y.ht'),overwrite=args.overwrite)
 
+        # Do the same for context table
+        full_context_ht = get_context(context_path_vep,gene_intervals)
         context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
         context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
         context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
         context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
         context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
+        context_ht.write(context_local_path,overwrite=args.overwrite)
+        context_x_ht.write(context_local_path.replace('.ht', '_x.ht'),overwrite=args.overwrite)
+        context_y_ht.write(context_local_path.replace('.ht', '_y.ht'),overwrite=args.overwrite)
 
-        exome_ht.write(exomes_ht_path)
-        exome_x_ht.write(exomes_x_ht_path)
-        exome_y_ht.write(exomes_y_ht_path)
+        # Get methylation-dependent mutation rate
+        mutation_rate_ht = hl.read_table(mutation_rate_ht_path).select('mu_snp')
+        mutation_rate_ht.write(mutation_rate_local_path,overwrite=args.overwrite)
 
-        context_ht.write(contexts_ht_path)
-        context_x_ht.write(contexts_x_ht_path)
-        context_y_ht.write(contexts_y_ht_path)
+        # Build model for observation rate based on coverage
+        coverage_ht = hl.read_table(po_coverage_local_path)
+        coverage_model, plateau_models = build_models(coverage_ht, args.trimers, True) 
+        with open('data/coverage_models.pkl','wb') as fid:
+            pickle.dump((coverage_model,plateau_models),fid)
+        
+
+
 
     if args.aggregate:
         print('Running aggregation of variants by grouping variables')
@@ -431,7 +418,7 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
     parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now)', default='standard')
     parser.add_argument('--skip_af_filter_upfront', help='Skip AF filter up front (to be applied later to ensure that it is not affecting population-specific constraint): not generally recommended', action='store_true')
-    parser.add_argument('--get_data',help='Extract data from google cloud')
+    parser.add_argument('--get_data',help='Extract data from google cloud',action='store_true')
     parser.add_argument('--aggregate', help='Aggregate by grouping variables', action='store_true')
     parser.add_argument('--finalise',help='Calculate estimates',action='store_true')
     parser.add_argument('--summarise', help='Report summary stats', action='store_true')
