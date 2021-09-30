@@ -1,16 +1,18 @@
 #!/usr/bin/python
 
 import argparse
-from itertools import product
 import pickle
 import random
-from typing import Dict, List, Optional, Set, Tuple, Any
 import hail as hl
 import pandas as pd
+from itertools import product
+from typing import Dict, List, Optional, Set, Tuple, Any
 from gnomad_pipeline.utils import *
+from setup import *
 from data_loader import * 
 from constraint_analysis import *
 from finalise_results import *
+from summarise_results import *
 
 # Summary of pipeline steps
 # Get gene list & parameters 
@@ -24,56 +26,31 @@ from finalise_results import *
 # Calculate proportion of variants observed by category
 # Finalise and calculate summary stats for release
 
-def get_gene_intervals():
-    # Get Ensembl gene intervals from file
-    df_intervals = pd.read_csv('data/Ensembl_Grch37_gpcr_genome_locations.csv')
-    df_intervals = df_intervals[['HGNC symbol','Grch37 symbol','Grch37 chromosome','Grch37 start bp','Grch37 end bp']]
-    df_intervals['locus_interval_txt'] = df_intervals['Grch37 chromosome'] + ':'  + \
-        + df_intervals['Grch37 start bp'].map(str) + '-' + df_intervals['Grch37 end bp'].map(str)
-    return list(df_intervals['locus_interval_txt'].map(hl.parse_locus_interval))
-
-
 def run_tests(paths):
     """Run tests of functions for randomly selected gene"""
     print('Test access to exomes and filtering')       
     test_intervals = get_gene_intervals()
-    test_intervals = random.sample(test_intervals,k=1)
-    print(f'Testing genes: {test_intervals}')
-    # test_data = get_data(test_intervals)
-    # print(f'Test data loaded: {test_data.summarise()}')
-    # test_results_provisional = get_proportion_observed(test_data)
-    # print(f'Test results filtered: {test_results_provisional.summarise()}')
-    # test_results_final = finalize_dataset(test_results_provisional)
+    test_intervals = test_intervals.sample(n=1,random_state=0)
+    symbols = test_intervals['HGNC symbol'].unique()
+    print(f'Testing genes: {symbols}')
+    test_data = get_data(paths, list(test_intervals['interval']))
+    #print(f'Test data loaded: {test_data.summarise()}')
+    #test_data = aggregate_by_groupings(paths, test_data)
+    #print(f'Test results filtered: {test_results_provisional.summarise()}')
+    #test_data = finalize_dataset(paths, test_data)
+    #test_summary = summarise_test(test_data)
     # print(f'Test results finalised: {test_results_final.summarise()}')
     # print(test_results_final)
 
 
 def main(args):
     # Set chosen grouping variables to aggregate on
-    grouping = ['gene','annotation','modifier']
     POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas') # set pops
 
-    root = './data'
-    # Google storage paths 
-    gs_paths = dict(
-        exomes_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/exomes_processed.ht/',
-        context_path = 'gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/',
-        mutation_rate_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/mutation_rate_methylation_bins.ht',
-        po_coverage_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
-    )
-    # Local input paths
-    local_input_paths = dict(
-        exomes_local_path = f'{root}/exomes.ht',
-        context_local_path = f'{root}/context.ht',
-        mutation_rate_local_path = f'{root}/context.ht', #???
-        po_coverage_local_path = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins.ht',  
-        possible_variants_ht_path = f'{root}/model/possible_data/possible_transcript_pop_{args.model}.ht',
-        po_output_path = f'{root}/{{subdir}}/prop_observed_{{subdir}}.ht'.format(subdir=args.model),
-        finalized_output_path = f'{root}/{{subdir}}/constraint_{{subdir}}.ht'.format(subdir=args.model),
-        summary_output_path = f'{root}/{{subdir}}/constraint_final_{{subdir}}.ht'.format(subdir=args.model)
-    )
-    paths = {**gs_paths, **local_input_paths}
-
+    # setup paths
+    paths = setup_paths(args.model)
+    # setup data 
+    data = {}
     
     hl.init(quiet=True)
 
@@ -84,21 +61,31 @@ def main(args):
         # Load gene intervals
         gene_intervals = get_gene_intervals()
         print('Getting data from Google Cloud...')
+        # Load observed mutation data, possible mutation data, and associated data
         data = get_data(paths, gene_intervals)
     
     if args.aggregate:
-        print('Running aggregation of variants by grouping variables')
+        if len(data) == 0:
+            print('Loading data...')
+            data = load_data_to_aggregate(paths)
+        print('Running aggregation of variants by grouping variables...')
         aggregate_by_groupings(paths, data)
        
     if args.finalise:
+        if len(data) == 0:
+            print('Loading data...')
+            data = load_data_to_finalise(paths)
         print('Joining tables and running aggregation by gene')
         # read PO hail tables for autosomes, X and Y chromosomes and join them
-        finalize_dataset(paths, data)
+        # Aggregate by final markers and calculate type-level metrics
+        data = finalize_dataset(paths, data)       
 
     if args.summarise:
-        print('Finalising summary stats')
+        if len(data) == 0:
+            data = load_data_to_summarise(paths)
+        print('Calculating summary stats')
         # write summary stats to output path
-        summarise(paths)
+        data = summarise(paths, data)
 
 
 if __name__ == '__main__':

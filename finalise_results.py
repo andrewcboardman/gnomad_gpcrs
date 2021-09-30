@@ -1,16 +1,40 @@
+import argparse
+import pickle
+import random
+import hail as hl
+import pandas as pd
+from itertools import product
+from typing import Dict, List, Optional, Set, Tuple, Any
+from gnomad_pipeline.utils import *
+from setup import setup_paths
 
-def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 'canonical'),
-                     n_partitions: int = 1000) -> hl.Table:
+
+def load_data_to_finalise(paths):
+    data = dict(zip(
+        ('po_ht','po_x_ht','po_y_ht'),
+        (hl.read_table(x) for x in (
+                paths['po_output_path'], 
+                paths['po_output_path'].replace('.ht','_x.ht'),
+                paths['po_output_path'].replace('.ht','_y.ht')
+            )
+        )
+    ))
+    return data
+
+
+def finalize_dataset(paths, data, pops = False):
     '''aggregate variants to calculate constraint metrics and significance'''
-    # Tidy this code a bit
+    # Z score calculation not feasible with partial dataset
+    # Need to include flagging of issues in constraint calculations
+    keys = ('gene', 'transcript', 'canonical')
+    n_partitions = 1000
 
-    po_ht = hl.read_table(po_output_path)
-    po_ht_x = hl.read_table(po_output_path.replace('.ht','_x.ht'))
-    po_ht_y = hl.read_table(po_output_path.replace('.ht','_y.ht'))
-    ht = po_ht.union(po_ht_x).union(po_ht_y)
+
+    # Take union of proportion observed tables
+    po_ht = data['po_ht'].union(data['po_x_ht']).union(data['po_y_ht'])
     
     # This function aggregates over genes in all cases, as XG spans PAR and non-PAR X
-    po_ht = po_ht.repartition(n_partitions).persist()
+    #po_ht = po_ht.repartition(n_partitions).persist()
 
     # Getting classic LoF annotations (no LOFTEE)
     classic_lof_annotations = hl.literal({'stop_gained', 'splice_donor_variant', 'splice_acceptor_variant'})
@@ -37,9 +61,11 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         'mu_mis': hl.agg.sum(mis_ht.mu),
         'possible_mis': hl.agg.sum(mis_ht.possible_variants)
     }
-    for pop in POPS:
-        agg_expr[f'exp_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'expected_variants_{pop}'])
-        agg_expr[f'obs_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'downsampling_counts_{pop}'])
+
+    if pops:
+        for pop in POPS:
+            agg_expr[f'exp_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'expected_variants_{pop}'])
+            agg_expr[f'obs_mis_{pop}'] = hl.agg.array_sum(mis_ht[f'downsampling_counts_{pop}'])
     mis_ht = mis_ht.group_by(*keys).aggregate(**agg_expr)
 
     # Aggregate pphen and non-pphen missense variants
@@ -65,9 +91,10 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         'mu_syn': hl.agg.sum(syn_ht.mu),
         'possible_syn': hl.agg.sum(syn_ht.possible_variants)
     }
-    for pop in POPS:
-        agg_expr[f'exp_syn_{pop}'] = hl.agg.array_sum(syn_ht[f'expected_variants_{pop}'])
-        agg_expr[f'obs_syn_{pop}'] = hl.agg.array_sum(syn_ht[f'downsampling_counts_{pop}'])
+    if pops:
+        for pop in POPS:
+            agg_expr[f'exp_syn_{pop}'] = hl.agg.array_sum(syn_ht[f'expected_variants_{pop}'])
+            agg_expr[f'obs_syn_{pop}'] = hl.agg.array_sum(syn_ht[f'downsampling_counts_{pop}'])
     syn_ht = syn_ht.group_by(*keys).aggregate(**agg_expr)
 
     # join constraint metrics
@@ -96,27 +123,32 @@ def finalize_dataset(po_ht: hl.Table, keys: Tuple[str] = ('gene', 'transcript', 
         **mis_non_pphen_cis[ht.key]
         )
 
-    # write hail table to output path
-    ht.write(finalised_output_path, args.overwrite)
-    hl.read_table(finalised_output_path).export(finalised_output_path.replace('.ht', '.txt.bgz'))
+    data['finalised_ht'] = ht
+    ht.write(paths['finalised_output_path'])
+
     # Calculate significance
-    # Z score calculation not feasible with partial dataset
-    # Need to include flagging of issues in constraint calculations
     # ht = calculate_all_z_scores(ht)
-    return ht
+    return data
+    
+
+def run_output_test(print_summary=True):
+    hl.init()
+    paths = setup_paths('test')
+    test_data = load_data_to_finalise(paths)
+    test_data = finalize_dataset(paths, test_data)
+    print('Test completed!')
 
 
-def summarise(paths):
-    final_input_path = paths['final_output_path']
-    summary_output_path = paths['summary_output_path']
-    ht = hl.read_table(summary_output_path)
-    mut_types = ('lof', 'mis', 'syn','mis_pphen','mis_non_pphen')
-    output_var_types = zip(('obs', 'exp', 'oe', 'oe', 'oe'),
-                            ('', '', '', '_lower', '_upper'))
-    output_vars = product(mut_types,output_var_types)
-    ht.select(
-        'gene','transcript','canonical',
-        *[f'{t}_{m}{ci}' for m, (t, ci) in output_vars],
-        gene_issues=ht.constraint_flag
-    ).select_globals().write(summary_output_path, overwrite=args.overwrite)
-    hl.read_table(summary_output_path).export(summary_output_path.replace('.ht', '.txt.bgz'))
+def main(args):
+    if args.test:
+        print('Running tests...')
+        run_output_test()
+    else:
+        print('Please run this script from custom_constraint_analysis.py')
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--test', help='Run tests',action='store_true')
+    args = parser.parse_args()
+    main(args)
