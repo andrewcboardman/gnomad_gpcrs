@@ -1,25 +1,9 @@
 import argparse
-import pickle
-import random
 import hail as hl
-import pandas as pd
 from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
 from gnomad_pipeline.utils import *
-from setup import setup_paths
-
-
-def load_data_to_finalise(paths):
-    data = dict(zip(
-        ('po_ht','po_x_ht','po_y_ht'),
-        (hl.read_table(x) for x in (
-                paths['po_output_path'], 
-                paths['po_output_path'].replace('.ht','_x.ht'),
-                paths['po_output_path'].replace('.ht','_y.ht')
-            )
-        )
-    ))
-    return data
+from load_data import *
 
 
 def finalize_dataset(paths, data, pops = False):
@@ -131,8 +115,28 @@ def finalize_dataset(paths, data, pops = False):
     return data
     
 
+def summarise(paths, data):
+    mut_types = ('lof', 'mis', 'syn','mis_pphen','mis_non_pphen')
+    output_var_types = zip(('obs', 'exp', 'oe', 'oe', 'oe'),
+                            ('', '', '', '_lower', '_upper'))
+    output_vars = product(mut_types,output_var_types)
+    data['summary'] = (data['finalised_ht']
+        .select(
+            'gene','transcript','canonical',
+            *[f'{t}_{m}{ci}' for m, (t, ci) in output_vars],
+            gene_issues=data['finalised_ht'].constraint_flag
+        )
+        .select_globals()
+    )
+    data['summary'].write(
+        paths['summary_output_path'], 
+        overwrite=args.overwrite
+    )
+    data['summary'].export(paths['summary_output_path'].replace('.ht', '.txt.bgz'))
+
+
 def run_output_test(print_summary=True):
-    hl.init()
+    hl.init(log='hail_logs/test_summarise_constraint_results.log')
     paths = setup_paths('test')
     test_data = load_data_to_finalise(paths)
     test_data = finalize_dataset(paths, test_data)

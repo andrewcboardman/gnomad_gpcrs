@@ -69,24 +69,36 @@ def build_plateau_models(ht: hl.Table, weighted: bool = False) -> Dict[str, Tupl
     return ht
                                         
                                        
-def build_plateau_models_pop(ht: hl.Table, weighted: bool = False) -> Dict[str, Tuple[float, float]]:
+def build_plateau_models_pop(ht: hl.Table, weighted: bool = False, pops=False) -> Dict[str, Tuple[float, float]]:
     """
     Calibrates high coverage model (returns intercept and slope)
-    this is causing stack overflow
     """
-   # pop_lengths = get_all_pop_lengths(ht)
-    agg_expr = {
-    #     pop: [hl.agg.group_by(ht.cpg,
-    #                          hl.agg.linreg(ht[f'observed_{pop}'][i] / ht.possible_variants, [1, ht.mu_snp]),
-    #                                        #weight=ht.possible_variants if weighted else None)
-    #                          ).map_values(lambda x: x.beta) for i in range(length)]
-    #     for length, pop in pop_lengths
-    }
-    agg_expr['total'] = hl.agg.group_by(ht.cpg,
-                                        hl.agg.linreg(ht.observed_variants / ht.possible_variants, [1, ht.mu_snp]),
-                                                    #  weight=ht.possible_variants if weighted else None)
-                                        ).map_values(lambda x: x.beta)
-    return  None #ht.aggregate(hl.struct(**agg_expr))
+    # For the moment, population-level plateau model calculations have been deprecated 
+
+    agg_expr = {}
+    if pops:
+        pop_lengths = get_all_pop_lengths(ht)
+        for length, pop in pop_lengths:
+            agg_expr[pop] = [
+                hl.agg.group_by(
+                    ht.cpg,
+                    hl.agg.linreg(ht[f'observed_{pop}'][i] / ht.possible_variants, [1, ht.mu_snp],weight=ht.possible_variants if weighted else None)
+                ).map_values(lambda x: x.beta) \
+                for i in range(length)
+                ]
+            
+    agg_expr['total'] = (
+        hl.agg.group_by(
+            ht.cpg,
+            hl.agg.linreg(
+                ht.observed_variants / ht.possible_variants, 
+                [1, ht.mu_snp], 
+                weight=ht.possible_variants if weighted else None
+            )
+        ).map_values(lambda x: x.beta)
+    )
+        
+    return ht.aggregate(hl.struct(**agg_expr))
 
 
 def get_all_pop_lengths(ht, prefix: str = 'observed_', pops: List[str] = POPS, skip_assertion: bool = False):
@@ -228,7 +240,9 @@ def count_variants(ht: hl.Table,
                    force_grouping: bool = False, singleton_expression: hl.expr.BooleanExpression = None,
                    impose_high_af_cutoff_here: bool = False) -> Union[hl.Table, Any]:
     """
-    Count variants by context, ref, alt, methylation_level
+    Count variants by context, ref, alt, methylation_level and additional variables.
+    Additional variables include gene and variant type
+    All variables must be in the original schema
     """
 
     grouping = hl.struct(context=ht.context, ref=ht.ref, alt=ht.alt)
@@ -282,7 +296,7 @@ def downsampling_counts_expr(ht: Union[hl.Table, hl.MatrixTable], pop: str = 'gl
 
 # Further aggregation by gene level to finalise dataset
 
-def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool = False) -> hl.Table:
+def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool = False, pops=False) -> hl.Table:
     '''Aggregate lof variants in genes for each population'''
     agg_expr = {
         'obs_lof': hl.agg.sum(lof_ht.variant_count),
@@ -290,9 +304,10 @@ def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool 
         'possible_lof': hl.agg.sum(lof_ht.possible_variants),
         'exp_lof': hl.agg.sum(lof_ht.expected_variants)
     }
-    for pop in POPS:
-        agg_expr[f'exp_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'expected_variants_{pop}'])
-        agg_expr[f'obs_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'downsampling_counts_{pop}'])
+    if pops: 
+        for pop in POPS:
+            agg_expr[f'exp_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'expected_variants_{pop}'])
+            agg_expr[f'obs_lof_{pop}'] = hl.agg.array_sum(lof_ht[f'downsampling_counts_{pop}'])
     lof_ht = lof_ht.group_by(*keys).aggregate(**agg_expr).persist()
     lof_ht = lof_ht.filter(lof_ht.exp_lof > 0)
     if calculate_pop_pLI:

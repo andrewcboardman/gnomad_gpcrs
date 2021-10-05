@@ -6,46 +6,10 @@ import pandas as pd
 from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
 from gnomad_pipeline.utils import *
-from setup import setup_paths
+from load_data import *
 
 HIGH_COVERAGE_CUTOFF = 40
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
-
-
-def load_data_to_aggregate(paths):
-    exomes_local_path = paths['exomes_local_path']
-    context_local_path = paths['context_local_path']
-    mutation_rate_local_path = paths['mutation_rate_local_path']
-
-    data = dict(
-        zip(
-            ['exome_ht','exome_x_ht','exome_y_ht',
-            'context_ht','context_x_ht','context_y_ht',
-            'mutation_rate_ht'],
-            [hl.read_table(path) for path in \
-                (
-                    exomes_local_path, 
-                    exomes_local_path.replace('.ht', '_x.ht'), 
-                    exomes_local_path.replace('.ht', '_y.ht'),
-                    context_local_path, 
-                    context_local_path.replace('.ht', '_x.ht'), 
-                    context_local_path.replace('.ht', '_y.ht'),
-                    mutation_rate_local_path
-                )
-            ]
-        )
-    )
-
-    # Get coverage models
-    with open('data/coverage_models.pkl','rb') as fid:
-        coverage_model, plateau_models = pickle.load(fid)
-    data.update(dict(zip(
-        ('coverage_model', 'plateau_models'),
-        (coverage_model, plateau_models)
-    )))
-    # Adjust this to allow custom grouping analysis
-    data['grouping'] = ['annotation','modifier','transcript', 'gene','canonical', 'coverage']
-    return data
 
 
 def aggregate_by_groupings(paths, data):
@@ -162,7 +126,7 @@ def get_possible_variants(context_ht, mutation_ht, coverage_model, plateau_model
 
 
 def run_analysis_test(print_summary=True):
-    hl.init()
+    hl.init(log='hail_logs/test_model_expected_variants.log')
     paths = setup_paths('test')
     test_data = load_data_to_aggregate(paths)
     test_data = aggregate_by_groupings(paths, test_data)

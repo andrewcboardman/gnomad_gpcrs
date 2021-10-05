@@ -1,16 +1,41 @@
 import argparse
 import pickle
-import random
-
-from numpy.core.numeric import full
-from setup import setup_paths
+import os
 import hail as hl
 import pandas as pd
-from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
 from gnomad_pipeline.utils import *
 
+def setup_paths(model):
+    root = './data'
+    # Google storage paths 
+    gs_paths = dict(
+        exomes_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/exomes_processed.ht/',
+        context_path = 'gs://gcp-public-data--gnomad/resources/context/grch37_context_vep_annotated.ht/',
+        mutation_rate_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/mutation_rate_methylation_bins.ht',
+        po_coverage_path = 'gs://gcp-public-data--gnomad/papers/2019-flagship-lof/v1.0/model/prop_observed_by_coverage_no_common_pass_filtered_bins.ht'
+    )
+    # Local input paths
+    local_input_paths = dict(
+        exomes_local_path = f'{root}/exomes.ht',
+        context_local_path = f'{root}/context.ht',
+        mutation_rate_local_path = f'{root}/mutation_rate_methylation_bins.ht',
+        po_coverage_local_path = f'{root}/prop_observed_by_coverage_no_common_pass_filtered_bins.ht',
+        coverage_models_local_path = f'{root}/coverage_models.pkl'
+    )
+    # Local output paths
+    output_subdir = f'{root}/{model}'
+    if not os.path.isdir(output_subdir):
+        os.mkdir(output_subdir)
+    local_output_paths = dict(
+        possible_variants_ht_path = f'{output_subdir}/possible_transcript_pop.ht',
+        po_output_path = f'{output_subdir}/prop_observed.ht',
+        finalized_output_path = f'{output_subdir}/constraint.ht',
+        summary_output_path = f'{output_subdir}/constraint_final.ht'
+    )
+    paths = {**gs_paths, **local_input_paths, **local_output_paths}
 
+    return paths
 
 def get_gene_intervals(test=False):
     
@@ -184,12 +209,61 @@ def filter_context(full_context_ht, context_local_path, overwrite):
     return context_ht, context_x_ht, context_y_ht
 
 
+def load_data_to_aggregate(paths):
+    exomes_local_path = paths['exomes_local_path']
+    context_local_path = paths['context_local_path']
+    mutation_rate_local_path = paths['mutation_rate_local_path']
+
+    data = dict(
+        zip(
+            ['exome_ht','exome_x_ht','exome_y_ht',
+            'context_ht','context_x_ht','context_y_ht',
+            'mutation_rate_ht'],
+            [hl.read_table(path) for path in \
+                (
+                    exomes_local_path, 
+                    exomes_local_path.replace('.ht', '_x.ht'), 
+                    exomes_local_path.replace('.ht', '_y.ht'),
+                    context_local_path, 
+                    context_local_path.replace('.ht', '_x.ht'), 
+                    context_local_path.replace('.ht', '_y.ht'),
+                    mutation_rate_local_path
+                )
+            ]
+        )
+    )
+
+    # Get coverage models
+    with open('data/coverage_models.pkl','rb') as fid:
+        coverage_model, plateau_models = pickle.load(fid)
+    data.update(dict(zip(
+        ('coverage_model', 'plateau_models'),
+        (coverage_model, plateau_models)
+    )))
+    # Adjust this to allow custom grouping analysis
+    data['grouping'] = ['annotation','modifier','transcript', 'gene','canonical', 'coverage']
+    return data
+
+
+def load_data_to_finalise(paths):
+    data = dict(zip(
+        ('po_ht','po_x_ht','po_y_ht'),
+        (hl.read_table(x) for x in (
+                paths['po_output_path'], 
+                paths['po_output_path'].replace('.ht','_x.ht'),
+                paths['po_output_path'].replace('.ht','_y.ht')
+            )
+        )
+    ))
+    return data
+
+
 def print_data_loader_test_summary(test_data):
     return test_data['exome_ht'].summarize()
 
 
 def run_data_loader_test(print_summary=True):
-    hl.init()
+    hl.init(log='hail_logs/test_load_data.log')
     paths = setup_paths('test')
     test_intervals = get_gene_intervals(test=True)
     #print(list(test_intervals['interval']))
