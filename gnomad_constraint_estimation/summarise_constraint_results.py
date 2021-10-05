@@ -2,8 +2,7 @@ import argparse
 import hail as hl
 from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
-from gnomad_pipeline.utils import *
-from load_data import *
+from .gnomad_pipeline.utils import *
 
 
 def finalize_dataset(paths, data, pops = False):

@@ -7,4 +7,4 @@ test:
 standard:
 	python custom_constraint_analysis.py --standard
 
-.PHONY: init test
+.PHONY: init test standard

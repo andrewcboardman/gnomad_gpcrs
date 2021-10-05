@@ -1,4 +1,4 @@
-from gnomad.utils.vep import *
+from .vep import *
 import hail as hl
 import os
 import copy

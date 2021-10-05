@@ -4,7 +4,7 @@ import os
 import hail as hl
 import pandas as pd
 from typing import Dict, List, Optional, Set, Tuple, Any
-from gnomad_pipeline.utils import *
+from .gnomad_pipeline.utils import *
 
 def setup_paths(model):
     root = './data'

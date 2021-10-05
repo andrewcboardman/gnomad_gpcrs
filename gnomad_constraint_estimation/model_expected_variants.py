@@ -1,12 +1,8 @@
 import argparse
-import pickle
-import random
 import hail as hl
-import pandas as pd
-from itertools import product
-from typing import Dict, List, Optional, Set, Tuple, Any
-from gnomad_pipeline.utils import *
-from load_data import *
+from typing import List
+from .gnomad_pipeline.utils import *
+from .load_data import *
 
 HIGH_COVERAGE_CUTOFF = 40
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')

@@ -8,11 +8,11 @@ import pandas as pd
 from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
 from gnomad_pipeline.utils import *
-from setup import *
-from data_loader import * 
-from constraint_analysis import *
-from finalise_results import *
-from summarise_results import *
+from gnomad_constraint_estimation.setup import *
+from gnomad_constraint_estimation.data_loader import * 
+from gnomad_constraint_estimation.constraint_analysis import *
+from gnomad_constraint_estimation.finalise_results import *
+from gnomad_constraint_estimation.summarise_results import *
 
 # Summary of pipeline steps
 # Get gene list & parameters 
