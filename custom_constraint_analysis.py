@@ -1,18 +1,8 @@
 #!/usr/bin/python
 
 import argparse
-import pickle
-import random
 import hail as hl
-import pandas as pd
-from itertools import product
-from typing import Dict, List, Optional, Set, Tuple, Any
-from gnomad_pipeline.utils import *
-from gnomad_constraint_estimation.setup import *
-from gnomad_constraint_estimation.data_loader import * 
-from gnomad_constraint_estimation.constraint_analysis import *
-from gnomad_constraint_estimation.finalise_results import *
-from gnomad_constraint_estimation.summarise_results import *
+import gnomadIC
 
 # Summary of pipeline steps
 # Get gene list & parameters 
@@ -26,79 +16,60 @@ from gnomad_constraint_estimation.summarise_results import *
 # Calculate proportion of variants observed by category
 # Finalise and calculate summary stats for release
 
-def run_tests(paths):
-    """Run tests of functions for randomly selected gene"""
-    print('Test access to exomes and filtering')       
-    test_intervals = get_gene_intervals()
-    test_intervals = test_intervals.sample(n=1,random_state=0)
-    symbols = test_intervals['HGNC symbol'].unique()
-    print(f'Testing genes: {symbols}')
-    test_data = get_data(paths, list(test_intervals['interval']))
-    #print(f'Test data loaded: {test_data.summarise()}')
-    #test_data = aggregate_by_groupings(paths, test_data)
-    #print(f'Test results filtered: {test_results_provisional.summarise()}')
-    #test_data = finalize_dataset(paths, test_data)
-    #test_summary = summarise_test(test_data)
-    # print(f'Test results finalised: {test_results_final.summarise()}')
-    # print(test_results_final)
+
+def run_tasks(tasks, paths, test = False):
+    '''Runs all requested tasks in specified path'''
+    data = {}
+    
+    if 'load_data' in tasks:
+        # Load gene intervals
+        gene_intervals = gnomadIC.get_gene_intervals(test)
+        # If in test mode only load 1 gene
+        print('Getting data from Google Cloud...')
+        # Load observed mutation data, possible mutation data, and associated data
+        data = gnomadIC.load_data(paths, gene_intervals)
+        print('Data loaded successfully!')
+    
+    if 'aggregate' in tasks:
+        if len(data) == 0:
+            print('Loading data...')
+            data = gnomadIC.load_data_to_aggregate(paths)
+        print('Running aggregation of variants by grouping variables...')
+        data = gnomadIC.aggregate(paths, data)
+        print('Aggregated variants successfully!')
+       
+    if 'estimate' in tasks:
+        if len(data) == 0:
+            print('Loading data...')
+            data = gnomadIC.load_data_to_estimate(paths)
+        print('Joining tables and running aggregation by gene')
+        data = gnomadIC.estimate(paths, data)
 
 
 def main(args):
-    # Set chosen grouping variables to aggregate on
-    POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas') # set pops
+    '''Controls whether to setup in test mode or not, and generates a run ID if not in test mode'''
+    # Initialise Hail, setting output 
+    hl.init(log='hail_logs/test_load_data.log', quiet=True)
 
-    # setup paths
-    paths = setup_paths(args.model)
-    # setup data 
-    data = {}
-    
-    hl.init(quiet=True)
-
+    # Setup paths
     if args.test:
-        run_tests(paths)
-
-    if args.get_data:
-        # Load gene intervals
-        gene_intervals = get_gene_intervals()
-        print('Getting data from Google Cloud...')
-        # Load observed mutation data, possible mutation data, and associated data
-        data = get_data(paths, gene_intervals)
+        print('Running in test mode: you can relax, sit back and enjoy the ride')
+        paths = gnomadIC.setup_paths('test')
+    else:
+        run_ID = f'{args.dataset}_{args.model}'
+        print(f'Running without test mode active: THIS IS NOT A DRILL. \n Run ID: {run_ID}')        
+        paths = gnomadIC.setup_paths(run_ID)
     
-    if args.aggregate:
-        if len(data) == 0:
-            print('Loading data...')
-            data = load_data_to_aggregate(paths)
-        print('Running aggregation of variants by grouping variables...')
-        aggregate_by_groupings(paths, data)
-       
-    if args.finalise:
-        if len(data) == 0:
-            print('Loading data...')
-            data = load_data_to_finalise(paths)
-        print('Joining tables and running aggregation by gene')
-        # read PO hail tables for autosomes, X and Y chromosomes and join them
-        # Aggregate by final markers and calculate type-level metrics
-        data = finalize_dataset(paths, data)       
-
-    if args.summarise:
-        if len(data) == 0:
-            data = load_data_to_summarise(paths)
-        print('Calculating summary stats')
-        # write summary stats to output path
-        data = summarise(paths, data)
+    # Run chosen tasks
+    run_tasks(args.tasks, paths = paths, test=args.test)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test', help='Run tests without actually requesting data',action='store_true')
+    parser.add_argument('--test', help='Run tests',action='store_true')
     parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
-    parser.add_argument('--trimers', help='Use trimers instead of heptamers', action='store_true')
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
     parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now) - warning not implemented', default='standard')
-    parser.add_argument('--skip_af_filter_upfront', help='Skip AF filter up front (to be applied later to ensure that it is not affecting population-specific constraint): not generally recommended', action='store_true')
-    parser.add_argument('--get_data',help='Extract data from google cloud',action='store_true')
-    parser.add_argument('--aggregate', help='Aggregate by grouping variables', action='store_true')
-    parser.add_argument('--finalise',help='Calculate estimates',action='store_true')
-    parser.add_argument('--summarise', help='Report summary stats', action='store_true')
+    parser.add_argument('--tasks', nargs='+', help='Which tasks to perform (select from load_data, aggregate, estimate)')
     args = parser.parse_args()
     main(args)
