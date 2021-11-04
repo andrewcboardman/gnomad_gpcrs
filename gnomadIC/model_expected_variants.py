@@ -1,14 +1,14 @@
 import argparse
 import hail as hl
 from typing import List
-import utils.utils as utils
+from .utils import utils
 from .load_data import *
 
 HIGH_COVERAGE_CUTOFF = 40
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 
-def aggregate_by_groupings(paths, data):
+def aggregate(paths, data):
     '''This is the new master function for performing constraint analysis'''
     # aggregate by chosen groupings & get proportion observed; write to file
     name = 'proportion_observed_output'
@@ -56,11 +56,6 @@ def get_proportion_observed(
     # Count observed variants by grouping
     ht = utils.count_variants(exome_ht, additional_grouping=grouping, partition_hint=2000, force_grouping=True,
                         count_downsamplings=[], impose_high_af_cutoff_here=not impose_high_af_cutoff_upfront)
-
-    # Match with expected frequency of variants by grouping
-    # This should not be renaming fields!!!
-    print('Observed variants \n: ', ht.describe())
-    print('Expected variants \n: ', possible_variants_ht.describe())
 
     ht = ht.join(possible_variants_ht, 'outer')
 
@@ -121,18 +116,18 @@ def get_possible_variants(context_ht, mutation_ht, coverage_model, plateau_model
 
 
 
-def run_analysis_test(print_summary=True):
+def run_analysis_test():
     hl.init(log='hail_logs/test_model_expected_variants.log')
     paths = setup_paths('test')
     test_data = load_data_to_aggregate(paths)
-    test_data = aggregate_by_groupings(paths, test_data)
+    test_data = aggregate(paths, test_data)
     #return paths, test_data
 
 
 def main(args):
     if args.test:
         print('Running tests...')
-        run_analysis_test(print_summary=True)
+        run_analysis_test()
     else:
         print('Please run this script from custom_constraint_analysis.py')
 

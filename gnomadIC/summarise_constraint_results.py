@@ -2,10 +2,10 @@ import argparse
 import hail as hl
 from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
-import utils.utils as utils
+from .utils import utils
 
 
-def finalize_dataset(paths, data, pops = False):
+def estimate(paths, data, pops = False, overwrite=False):
     '''aggregate variants to calculate constraint metrics and significance'''
     # Z score calculation not feasible with partial dataset
     # Need to include flagging of issues in constraint calculations
@@ -14,10 +14,9 @@ def finalize_dataset(paths, data, pops = False):
 
 
     # Take union of proportion observed tables
-    po_ht = data['po_ht'].union(data['po_x_ht']).union(data['po_y_ht'])
-    
     # This function aggregates over genes in all cases, as XG spans PAR and non-PAR X
-    #po_ht = po_ht.repartition(n_partitions).persist()
+    po_ht = data['po_ht'].union(data['po_x_ht']).union(data['po_y_ht'])
+    po_ht = po_ht.repartition(n_partitions).persist()
 
     # Getting classic LoF annotations (no LOFTEE)
     classic_lof_annotations = hl.literal({'stop_gained', 'splice_donor_variant', 'splice_acceptor_variant'})
@@ -88,7 +87,7 @@ def finalize_dataset(paths, data, pops = False):
         **syn_ht[lof_ht_classic.key], 
         **lof_ht[lof_ht_classic.key],
         **lof_ht_classic_hc[lof_ht_classic.key]
-        )
+    )
 
     # calculate confidence intervals
     syn_cis = utils.oe_confidence_interval(ht, ht.obs_syn, ht.exp_syn, prefix='oe_syn')
@@ -107,38 +106,38 @@ def finalize_dataset(paths, data, pops = False):
         )
 
     data['finalised_ht'] = ht
-    ht.write(paths['finalised_output_path'])
+    ht.write(paths['finalized_output_path'],overwrite=overwrite)
 
     # Calculate significance
     # ht = calculate_all_z_scores(ht)
-    return data
-    
 
-def summarise(paths, data):
-    mut_types = ('lof', 'mis', 'syn','mis_pphen','mis_non_pphen')
+    mut_types = (
+        'lof', 'mis', 'syn','mis_pphen','mis_non_pphen'
+        )
     output_var_types = zip(('obs', 'exp', 'oe', 'oe', 'oe'),
                             ('', '', '', '_lower', '_upper'))
     output_vars = product(mut_types,output_var_types)
     data['summary'] = (data['finalised_ht']
         .select(
-            'gene','transcript','canonical',
             *[f'{t}_{m}{ci}' for m, (t, ci) in output_vars],
-            gene_issues=data['finalised_ht'].constraint_flag
+            #gene_issues=data['finalised_ht'].constraint_flag 
+            # This is not currently included but needs to be
         )
         .select_globals()
     )
     data['summary'].write(
         paths['summary_output_path'], 
-        overwrite=args.overwrite
+        overwrite=overwrite
     )
     data['summary'].export(paths['summary_output_path'].replace('.ht', '.txt.bgz'))
+    return data
 
 
 def run_output_test(print_summary=True):
     hl.init(log='hail_logs/test_summarise_constraint_results.log')
     paths = utils.setup_paths('test')
     test_data = utils.load_data_to_finalise(paths)
-    test_data = finalize_dataset(paths, test_data)
+    test_data = estimate(paths, test_data)
     print('Test completed!')
 
 

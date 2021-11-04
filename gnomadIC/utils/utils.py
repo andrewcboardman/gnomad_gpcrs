@@ -73,7 +73,7 @@ def build_plateau_models_pop(ht: hl.Table, weighted: bool = False, pops=False) -
     """
     Calibrates high coverage model (returns intercept and slope)
     """
-    # For the moment, population-level plateau model calculations have been deprecated 
+    # For the moment, population-level plateau model calculations have been removed as they caused segmentation faults
 
     agg_expr = {}
     if pops:
