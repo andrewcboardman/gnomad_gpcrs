@@ -25,6 +25,81 @@ def get_gene_intervals(test=False):
         return df_intervals['interval'].tolist()
 
 
+def get_table(path, columns, intervals):
+   # Path to full exome table
+    full_ht = hl.read_table(path)
+    # Select relevant columns to avoid getting too much data 
+    full_ht = full_ht.select(*columns)
+    # Filter by gene
+    ht = hl.filter_intervals(full_ht, intervals)
+    # Prepare exomes
+    ht = utils.prepare_ht(ht, trimer=True)
+    return ht 
+
+
+def annotate_exomes(exomes_ht: hl.Table, context_ht: hl.Table,
+                      overwrite: bool = False) -> None:
+    context_ht = context_ht.annotate(
+        vep=context_ht.vep.drop('colocated_variants')
+        )
+    exomes_ht = exomes_ht.annotate(**context_ht[exomes_ht.key], pass_filters=hl.len(exomes_ht.filters) == 0)
+    return exomes_ht
+
+
+def filter_exomes(exome_ht, af_cutoff=0.001, dataset: str = 'gnomad', 
+        impose_high_af_cutoff_upfront: bool = True):
+    # Filter by allele count > 0, allele fraction < cutoff, coverage > 0
+
+    freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
+    def keep_criteria(ht):
+        crit = (ht.freq[freq_index].AC > 0) & ht.pass_filters & (ht.coverage > 0)
+        if impose_high_af_cutoff_upfront:
+            crit &= (ht.freq[freq_index].AF <= af_cutoff)
+        return crit
+    exome_ht = exome_ht.filter(keep_criteria(exome_ht))
+    return exome_ht
+
+
+def prepare_table_vep(ht, columns):
+    ht = utils.add_most_severe_csq_to_tc_within_ht(ht)
+    ht = ht.transmute(transcript_consequences=ht.vep.transcript_consequences)  
+    ht = ht.explode(ht.transcript_consequences)
+    ht, _ = utils.annotate_constraint_groupings(ht)
+    return ht
+
+
+def prepare_exomes_and_context(
+        exome_ht: hl.Table,
+        context_ht: hl.Table,
+        
+    ) -> hl.Table:
+    '''Prepare exome mutation data for modelling '''
+    # For standard analysis, assume the worst predicted transcript consequence takes place
+    exome_ht = prepare_table_vep(exome_ht)
+    context_ht = prepare_table_vep(context_ht)
+
+
+    # Annotate variants with grouping variables
+    exome_ht, grouping = utils.annotate_constraint_groupings(exome_ht)
+    exome_ht = exome_ht.select('context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)    
+    context_ht, grouping = utils.annotate_constraint_groupings(context_ht)
+    context_ht = context_ht.filter(hl.is_defined(context_ht.exome_coverage)).select(
+        'context', 'ref', 'alt', 'methylation_level', *grouping)
+
+    exome_ht = filter_exomes(exome_ht)
+
+    return exome_ht, context_ht, grouping
+
+
+def split_table(full_ht):
+    # filter into X, Y and autosomal regions for separate aggregation
+    autosome_ht = full_ht.filter(full_ht.locus.in_autosome_or_par())
+    x_ht = hl.filter_intervals(full_ht, [hl.parse_locus_interval('X')])
+    x_ht = x_ht.filter(x_ht.locus.in_x_nonpar())
+    y_ht = hl.filter_intervals(full_ht, [hl.parse_locus_interval('Y')])
+    y_ht = y_ht.filter(y_ht.locus.in_y_nonpar())
+    return (autosome_ht, x_ht, y_ht)
+
 
 def get_data(paths, gene_intervals, overwrite=True, trimers=False):
     '''
@@ -33,37 +108,95 @@ def get_data(paths, gene_intervals, overwrite=True, trimers=False):
     The exomes and context data should always be downloaded as new gene intervals are passed in. 
     The mutation rate by methylation and proportion observed by coverage tables are stored locally.
     They should be downloaded if not present but the control flow to do this isn't yet implemented 
+
+    Changes that could be made 
+    - refactor some of the functions in here to serve exomes & context 
+    - save whole exomes and context tables to avoid splitting data into files that don't need to exist
     '''
 
-    data = {}
-
     # Get relevant exomes & context data
-    full_exome_ht = get_exomes(paths['exomes_path'], gene_intervals)    
-    full_context_ht = get_context(paths['context_path'], gene_intervals)
+    full_exome_ht = get_table(
+        paths['exomes_path'], 
+        (
+            'vep',
+            'context',
+            'methylation',
+            'coverage',
+            'freq',
+            'filters'
+        ),
+        gene_intervals
+    )
+    full_context_ht = get_table(
+        paths['context_path'], 
+        (
+            'vep',
+            'context',
+            'methylation',
+            'coverage'
+        ),
+        gene_intervals
+    )
 
-    # Preprocess by adding context
-    annotated_exome_ht = pre_process_exomes(full_exome_ht, full_context_ht)
+    # Add context to exomes and filter
+    annotated_exome_ht = annotate_exomes(
+        full_exome_ht, 
+        full_context_ht
+    )
 
-    # Prepare tables with constraint groupings
-    prepped_exome_ht, prepped_context_ht, grouping = prepare_exomes_and_context(annotated_exome_ht,full_context_ht)
+    # Prepare tables including all necessary information
+    prepped_exome_ht = prepare_table_vep(
+        annotated_exome_ht,
+        (
+            'context', 
+            'ref', 
+            'alt', 
+            'methylation_level', 
+            'annotation',
+            'modifier',
+            'transcript',
+            'gene',
+            'canonical',
+            'coverage',
+            'freq', 
+            'pass_filters'
+        )
+    )
 
-    # Split tables into autosomes, X and Y chromosomes and write to file
-    exome_ht, exome_x_ht, exome_y_ht = filter_exomes(prepped_exome_ht, paths['exomes_local_path'], overwrite)
-    context_ht,context_x_ht, context_y_ht = filter_context(prepped_context_ht, paths['context_local_path'], overwrite)
+    prepped_context_ht = prepare_table_vep(
+        full_context_ht,
+        (
+            'context', 
+            'ref', 
+            'alt', 
+            'methylation_level', 
+            'annotation',
+            'modifier',
+            'transcript',
+            'gene',
+            'canonical', 
+            'coverage'
+        )
+    )
 
-    # Add tables to data dictionary
-    data.update(dict(zip(
-        ('exome_ht', 'exome_x_ht', 'exome_y_ht', 'context_ht', 'context_x_ht', 'context_y_ht','grouping'),
-        (exome_ht, exome_x_ht, exome_y_ht, context_ht, context_x_ht, context_y_ht,grouping)
-    )))
-    
+    # filter exome variants by frequency
+    filtered_exome_ht = filter_exomes(prepped_exome_ht)
+
+    # Write to file
+    filtered_exome_ht.write(paths['exomes_local_path'], overwrite=overwrite)
+    prepped_context_ht.write(paths['context_local_path'], overwrite=overwrite)
+     
+    data = load_data_to_aggregate(paths)
+    return data
+
+
+def load_models(paths):
     # Get table for mutation rate if it doesn't exist  
     if os.path.isdir(paths['mutation_rate_local_path']):
-        data['mutation_rate_ht'] = hl.read_table(paths['mutation_rate_local_path'])
+        mutation_rate_ht = hl.read_table(paths['mutation_rate_local_path'])
     else:
         mutation_rate_ht = hl.read_table(paths['mutation_rate_path']).select('mu_snp')
-        mutation_rate_ht.write(paths['mutation_rate_local_path'],overwrite=overwrite)
-        data['mutation_rate_ht'] = mutation_rate_ht
+        mutation_rate_ht.write(paths['mutation_rate_local_path'])
     
     # Get coverage models if they don't exist
     if os.path.isfile(paths['coverage_models_local_path']):
@@ -83,136 +216,44 @@ def get_data(paths, gene_intervals, overwrite=True, trimers=False):
         with open('data/coverage_models.pkl','wb') as fid:
             pickle.dump((coverage_model,plateau_models),fid)  
 
-    data.update(dict(zip(
-        ('coverage_model', 'plateau_models'),
-        (coverage_model, plateau_models)
-    )))
-
-    return data
-
-
-def get_exomes(exomes_path, gene_intervals):
-    # Path to full exome table
-    full_exome_ht = hl.read_table(exomes_path)
-    # Select relevant columns to avoid getting too much data 
-    full_exome_ht = full_exome_ht.select('freq','vep','context','methylation','coverage','filters'
-    )
-    # Filter by gene
-    exome_ht = hl.filter_intervals(full_exome_ht, gene_intervals)
-    # Prepare exomes
-    exome_ht = utils.prepare_ht(exome_ht, trimer=True)
-    return exome_ht
-
-
-def get_context(context_ht_path, gene_intervals):
-    full_context_ht = hl.read_table(context_ht_path)
-    full_context_ht = full_context_ht.select('vep','context','methylation','coverage')
-    # Filter this table in similar way to exomes ht
-    selected_context_ht = hl.filter_intervals(full_context_ht,gene_intervals)
-    selected_context_ht = utils.prepare_ht(selected_context_ht, trimer=True)
-    return selected_context_ht
-
-
-def pre_process_exomes(exomes_ht: hl.Table, context_ht: hl.Table,
-                      overwrite: bool = False) -> None:
-    context_ht = context_ht.annotate(vep=context_ht.vep.drop('colocated_variants'))
-    return exomes_ht.annotate(**context_ht[exomes_ht.key], pass_filters=hl.len(exomes_ht.filters) == 0)#.write(output_ht_path, overwrite)
-
-
-def prepare_exomes_and_context(
-        exome_ht: hl.Table,
-        context_ht: hl.Table,
-        dataset: str = 'gnomad', 
-        impose_high_af_cutoff_upfront: bool = True
-    ) -> hl.Table:
-    '''Prepare exome mutation data for modelling '''
-    # For standard analysis, assume the worst predicted transcript consequence takes place
-    exome_ht = utils.add_most_severe_csq_to_tc_within_ht(exome_ht)
-    exome_ht = exome_ht.transmute(transcript_consequences=exome_ht.vep.transcript_consequences)  
-    exome_ht = exome_ht.explode(exome_ht.transcript_consequences)
-    # Annotate variants with grouping variables
-    exome_ht, grouping = utils.annotate_constraint_groupings(exome_ht)
-    exome_ht = exome_ht.select('context', 'ref', 'alt', 'methylation_level', 'freq', 'pass_filters', *grouping)
-
-    # annotate and filter context table in same way. Exome coverage or genome coverage?
-    context_ht = utils.add_most_severe_csq_to_tc_within_ht(context_ht)
-    context_ht = context_ht.transmute(transcript_consequences=context_ht.vep.transcript_consequences)  
-    context_ht = context_ht.explode(context_ht.transcript_consequences)
-    context_ht, grouping = utils.annotate_constraint_groupings(context_ht)
-    context_ht = context_ht.filter(hl.is_defined(context_ht.exome_coverage)).select(
-        'context', 'ref', 'alt', 'methylation_level', *grouping)
-
-    # Filter by allele count > 0, allele fraction < cutoff, coverage > 0
-    af_cutoff = 0.001
-    freq_index = exome_ht.freq_index_dict.collect()[0][dataset]
-    def keep_criteria(ht):
-        crit = (ht.freq[freq_index].AC > 0) & ht.pass_filters & (ht.coverage > 0)
-        if impose_high_af_cutoff_upfront:
-            crit &= (ht.freq[freq_index].AF <= af_cutoff)
-        return crit
-    exome_ht = exome_ht.filter(keep_criteria(exome_ht))
-
-    return exome_ht, context_ht, grouping
-
-
-def filter_exomes(full_exome_ht, exomes_local_path, overwrite):
-    # filter into X, Y and autosomal regions
-    exome_ht = full_exome_ht.filter(full_exome_ht.locus.in_autosome_or_par())
-    exome_x_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('X')])
-    exome_x_ht = exome_x_ht.filter(exome_x_ht.locus.in_x_nonpar())
-    exome_y_ht = hl.filter_intervals(full_exome_ht, [hl.parse_locus_interval('Y')])
-    exome_y_ht = exome_y_ht.filter(exome_y_ht.locus.in_y_nonpar())
-    exome_ht.write(exomes_local_path,overwrite=overwrite)
-    exome_x_ht.write(exomes_local_path.replace('.ht', '_x.ht'),overwrite=overwrite)
-    exome_y_ht.write(exomes_local_path.replace('.ht', '_y.ht'),overwrite=overwrite)
-    return exome_ht, exome_x_ht, exome_y_ht
-
-
-def filter_context(full_context_ht, context_local_path, overwrite):
-    context_ht = full_context_ht.filter(full_context_ht.locus.in_autosome_or_par())
-    context_x_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('X')])
-    context_x_ht = context_x_ht.filter(context_x_ht.locus.in_x_nonpar())
-    context_y_ht = hl.filter_intervals(full_context_ht, [hl.parse_locus_interval('Y')])
-    context_y_ht = context_y_ht.filter(context_y_ht.locus.in_y_nonpar())
-    context_ht.write(context_local_path,overwrite=overwrite)
-    context_x_ht.write(context_local_path.replace('.ht', '_x.ht'),overwrite=overwrite)
-    context_y_ht.write(context_local_path.replace('.ht', '_y.ht'),overwrite=overwrite)
-    return context_ht, context_x_ht, context_y_ht
-
+    models = {
+        'mutation_rate_ht': mutation_rate_ht,
+        'coverage_model': coverage_model,
+        'plateau_model': plateau_models
+    }
+    return models
 
 def load_data_to_aggregate(paths):
-    exomes_local_path = paths['exomes_local_path']
-    context_local_path = paths['context_local_path']
-    mutation_rate_local_path = paths['mutation_rate_local_path']
+    # Load data
+    exome_ht = hl.read_table(paths['exomes_local_path'])
+    context_ht = hl.read_table(paths['context_local_path'])
+    exome_auto_ht, exome_x_ht, exome_y_ht = split_table(exome_ht)
+    context_auto_ht, context_x_ht, context_y_ht = split_table(context_ht)
 
-    data = dict(
-        zip(
-            ['exome_ht','exome_x_ht','exome_y_ht',
+    # filter into X, Y and autosomal regions
+    data = dict(zip(
+        [
+            'exome_ht','exome_x_ht','exome_y_ht',
             'context_ht','context_x_ht','context_y_ht',
-            'mutation_rate_ht'],
-            [hl.read_table(path) for path in \
-                (
-                    exomes_local_path, 
-                    exomes_local_path.replace('.ht', '_x.ht'), 
-                    exomes_local_path.replace('.ht', '_y.ht'),
-                    context_local_path, 
-                    context_local_path.replace('.ht', '_x.ht'), 
-                    context_local_path.replace('.ht', '_y.ht'),
-                    mutation_rate_local_path
-                )
-            ]
-        )
-    )
+        ],
+        [
+            exome_auto_ht, exome_x_ht, exome_y_ht,
+            context_auto_ht, context_x_ht, context_y_ht,
+        ]
+    ))
 
-    # Get coverage models
-    with open('data/coverage_models.pkl','rb') as fid:
-        coverage_model, plateau_models = pickle.load(fid)
-    data.update(dict(zip(
-        ('coverage_model', 'plateau_models'),
-        (coverage_model, plateau_models)
-    )))
     # Adjust this to allow custom grouping analysis
-    data['grouping'] = ['annotation','modifier','transcript', 'gene','canonical', 'coverage']
+    data['grouping'] = [
+        'annotation',
+        'modifier',
+        'transcript', 
+        'gene',
+        'canonical',
+        'coverage'
+        ]
+    
+    models = load_models(paths)
+    data.update(models)
     return data
 
 
@@ -227,33 +268,3 @@ def load_data_to_estimate(paths):
         )
     ))
     return data
-
-
-def print_data_loader_test_summary(test_data):
-    return test_data['exome_ht'].summarize()
-
-
-def run_data_loader_test(print_summary=True):
-    hl.init(log='hail_logs/test_load_data.log')
-    paths = setup_paths('test')
-    test_intervals = get_gene_intervals(test=True)
-    #print(list(test_intervals['interval']))
-    test_data = get_data(paths, list(test_intervals['interval']))
-    if print_summary:
-        print_data_loader_test_summary(test_data)
-    return paths, test_data
-
-
-def main(args):
-    if args.test:
-        print('Running tests...')
-        run_data_loader_test(print_summary=True)
-    else:
-        print('Please run this script from custom_constraint_analysis.py')
-
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--test', help='Run tests',action='store_true')
-    args = parser.parse_args()
-    main(args)

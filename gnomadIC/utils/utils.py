@@ -7,6 +7,39 @@ from typing import Dict, List, Optional, Set, Tuple, Any
 HIGH_COVERAGE_CUTOFF = 40
 POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
+
+
+def annotate_expected_mutations(ht, mutation_rate_ht, plateau_models, coverage_model, half_cutoff = False, pops = False):
+    ht = annotate_with_mu(ht, mutation_rate_ht)
+    ht = ht.transmute(possible_variants=ht.variant_count)
+    ht = annotate_variant_types(ht.annotate(mu_agg=ht.mu_snp * ht.possible_variants))
+    model = hl.literal(plateau_models.total)[ht.cpg]
+
+    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
+    ann_expr = {
+        'adjusted_mutation_rate': ht.mu_agg * model[1] + model[0],
+        'coverage_correction': hl.case()
+            .when(ht.coverage == 0, 0)
+            .when(ht.coverage >= cov_cutoff, 1)
+            .default(coverage_model[1] * hl.log10(ht.coverage) + coverage_model[0])
+    }
+    if pops:
+        for pop in POPS:
+            pop_model = hl.literal(plateau_models[pop])
+            slopes = hl.map(lambda f: f[ht.cpg][1], pop_model)
+            intercepts = hl.map(lambda f: f[ht.cpg][0], pop_model)
+            ann_expr[f'adjusted_mutation_rate_{pop}'] = ht.mu_agg * slopes + intercepts
+    ht = ht.annotate(**ann_expr)
+    ann_expr = {
+        'expected_variants': ht.adjusted_mutation_rate * ht.coverage_correction,
+        'mu': ht.mu_agg * ht.coverage_correction
+    }
+    if pops:
+        for pop in POPS:
+            ann_expr[f'expected_variants_{pop}'] = ht[f'adjusted_mutation_rate_{pop}'] * ht.coverage_correction
+    ht = ht.annotate(**ann_expr)
+
+
 def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_snp',
                      keys: Tuple[str] = ('context', 'ref', 'alt', 'methylation_level')) -> hl.Table:
     mu = hl.literal(mutation_ht.aggregate(hl.dict(hl.agg.collect(

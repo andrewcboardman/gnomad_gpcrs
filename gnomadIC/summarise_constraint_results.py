@@ -4,6 +4,16 @@ from itertools import product
 from typing import Dict, List, Optional, Set, Tuple, Any
 from .utils import utils
 
+# def estimate_custom(
+#         paths, 
+#         data, 
+#         labels = ['pLof_HC','mis_pphen','mis_non_pphen'],
+#         keys = ('gene', 'transcript', 'canonical'), 
+#         pops = False, 
+#         overwrite=False
+#         ):
+#     n_partitions = 1000
+
 
 def estimate(paths, data, pops = False, overwrite=False):
     '''aggregate variants to calculate constraint metrics and significance'''
