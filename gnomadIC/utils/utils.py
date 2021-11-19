@@ -9,44 +9,6 @@ POPS = ('global', 'afr', 'amr', 'eas', 'nfe', 'sas')
 
 
 
-def annotate_expected_mutations(ht, mutation_rate_ht, plateau_models, coverage_model, half_cutoff = False, pops = False):
-    ht = annotate_with_mu(ht, mutation_rate_ht)
-    ht = ht.transmute(possible_variants=ht.variant_count)
-    ht = annotate_variant_types(ht.annotate(mu_agg=ht.mu_snp * ht.possible_variants))
-    model = hl.literal(plateau_models.total)[ht.cpg]
-
-    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
-    ann_expr = {
-        'adjusted_mutation_rate': ht.mu_agg * model[1] + model[0],
-        'coverage_correction': hl.case()
-            .when(ht.coverage == 0, 0)
-            .when(ht.coverage >= cov_cutoff, 1)
-            .default(coverage_model[1] * hl.log10(ht.coverage) + coverage_model[0])
-    }
-    if pops:
-        for pop in POPS:
-            pop_model = hl.literal(plateau_models[pop])
-            slopes = hl.map(lambda f: f[ht.cpg][1], pop_model)
-            intercepts = hl.map(lambda f: f[ht.cpg][0], pop_model)
-            ann_expr[f'adjusted_mutation_rate_{pop}'] = ht.mu_agg * slopes + intercepts
-    ht = ht.annotate(**ann_expr)
-    ann_expr = {
-        'expected_variants': ht.adjusted_mutation_rate * ht.coverage_correction,
-        'mu': ht.mu_agg * ht.coverage_correction
-    }
-    if pops:
-        for pop in POPS:
-            ann_expr[f'expected_variants_{pop}'] = ht[f'adjusted_mutation_rate_{pop}'] * ht.coverage_correction
-    ht = ht.annotate(**ann_expr)
-
-
-def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_snp',
-                     keys: Tuple[str] = ('context', 'ref', 'alt', 'methylation_level')) -> hl.Table:
-    mu = hl.literal(mutation_ht.aggregate(hl.dict(hl.agg.collect(
-        (hl.struct(**{k: mutation_ht[k] for k in keys}), mutation_ht.mu_snp)))))
-    mu = mu.get(hl.struct(**{k: ht[k] for k in keys}))
-    return ht.annotate(**{output_loc: hl.case().when(hl.is_defined(mu), mu).or_error('Missing mu')})
-
 # Model building
 
 def build_models(coverage_ht: hl.Table, trimers: bool = False, weighted: bool = False, half_cutoff = False
@@ -248,23 +210,68 @@ def annotate_constraint_groupings(ht: Union[hl.Table, hl.MatrixTable],
     Need to add `'coverage': ht.exome_coverage` here (which will get corrected out later)
     """
     groupings = {
+        'gene': ht.transcript_consequences.gene_symbol,
+        'transcript': ht.transcript_consequences.transcript_id,
+        'canonical': hl.or_else(ht.transcript_consequences.canonical == 1, False),
+        'hgvsp':ht.transcript_consequences.hgvsp,
+        'aa_wt': ht.transcript_consequences.amino_acids[0],
+        'aa_mut': ht.transcript_consequences.amino_acids[-1],
+        'aa_pos_start': ht.transcript_consequences.protein_start,
+        'aa_pos_end': ht.transcript_consequences.protein_end,
         'annotation': ht.transcript_consequences.most_severe_consequence,
         'modifier': hl.case()
             .when(hl.is_defined(ht.transcript_consequences.lof),
                     ht.transcript_consequences.lof)
             .when(hl.is_defined(ht.transcript_consequences.polyphen_prediction),
                     ht.transcript_consequences.polyphen_prediction)
-            .default('None'),
-        'transcript': ht.transcript_consequences.transcript_id,
-        'gene': ht.transcript_consequences.gene_symbol,
-        'canonical': hl.or_else(ht.transcript_consequences.canonical == 1, False),
-        'coverage': ht.exome_coverage
+            .default('None')
         }
     
     ht = ht.annotate(**groupings) if isinstance(ht, hl.Table) else ht.annotate_rows(**groupings)
     return ht, list(groupings.keys())
 
 # Aggregation of variant counts
+
+
+def annotate_expected_mutations(ht, mutation_rate_ht, plateau_models, coverage_model, half_cutoff = False, pops = False):
+    ht = annotate_with_mu(ht, mutation_rate_ht)
+    ht = ht.transmute(possible_variants=ht.variant_count)
+    ht = annotate_variant_types(ht.annotate(mu_agg=ht.mu_snp * ht.possible_variants))
+    model = hl.literal(plateau_models.total)[ht.cpg]
+
+    cov_cutoff = (HIGH_COVERAGE_CUTOFF / half_cutoff) if half_cutoff else HIGH_COVERAGE_CUTOFF
+    ann_expr = {
+        'adjusted_mutation_rate': ht.mu_agg * model[1] + model[0],
+        'coverage_correction': hl.case()
+            .when(ht.coverage == 0, 0)
+            .when(ht.coverage >= cov_cutoff, 1)
+            .default(coverage_model[1] * hl.log10(ht.coverage) + coverage_model[0])
+    }
+    if pops:
+        for pop in POPS:
+            pop_model = hl.literal(plateau_models[pop])
+            slopes = hl.map(lambda f: f[ht.cpg][1], pop_model)
+            intercepts = hl.map(lambda f: f[ht.cpg][0], pop_model)
+            ann_expr[f'adjusted_mutation_rate_{pop}'] = ht.mu_agg * slopes + intercepts
+    ht = ht.annotate(**ann_expr)
+    ann_expr = {
+        'expected_variants': ht.adjusted_mutation_rate * ht.coverage_correction,
+        'mu': ht.mu_agg * ht.coverage_correction
+    }
+    if pops:
+        for pop in POPS:
+            ann_expr[f'expected_variants_{pop}'] = ht[f'adjusted_mutation_rate_{pop}'] * ht.coverage_correction
+    ht = ht.annotate(**ann_expr)
+    return ht
+
+
+def annotate_with_mu(ht: hl.Table, mutation_ht: hl.Table, output_loc: str = 'mu_snp',
+                     keys: Tuple[str] = ('context', 'ref', 'alt', 'methylation_level')) -> hl.Table:
+    mu = hl.literal(mutation_ht.aggregate(hl.dict(hl.agg.collect(
+        (hl.struct(**{k: mutation_ht[k] for k in keys}), mutation_ht.mu_snp)))))
+    mu = mu.get(hl.struct(**{k: ht[k] for k in keys}))
+    return ht.annotate(**{output_loc: hl.case().when(hl.is_defined(mu), mu).or_error('Missing mu')})
+
 
 def count_variants(ht: hl.Table,
                    count_singletons: bool = False, count_downsamplings: Optional[List[str]] = (),
@@ -277,7 +284,6 @@ def count_variants(ht: hl.Table,
     Additional variables include gene and variant type
     All variables must be in the original schema
     """
-
     grouping = hl.struct(context=ht.context, ref=ht.ref, alt=ht.alt)
     if not omit_methylation:
         grouping = grouping.annotate(methylation_level=ht.methylation_level)
@@ -332,7 +338,7 @@ def downsampling_counts_expr(ht: Union[hl.Table, hl.MatrixTable], pop: str = 'gl
 def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool = False, pops=False) -> hl.Table:
     '''Aggregate lof variants in genes for each population'''
     agg_expr = {
-        'obs_lof': hl.agg.sum(lof_ht.variant_count),
+        'obs_lof': hl.agg.sum(lof_ht.observed_variants),
         'mu_lof': hl.agg.sum(lof_ht.mu),
         'possible_lof': hl.agg.sum(lof_ht.possible_variants),
         'exp_lof': hl.agg.sum(lof_ht.expected_variants)
@@ -365,26 +371,61 @@ def collapse_lof_ht(lof_ht: hl.Table, keys: Tuple[str], calculate_pop_pLI: bool 
 
 # Calculation of summary stats
 
-def oe_confidence_interval(ht: hl.Table, obs: hl.expr.Int32Expression, exp: hl.expr.Float32Expression,
-                           prefix: str = 'oe', alpha: float = 0.05, select_only_ci_metrics: bool = True) -> hl.Table:
+def oe_confidence_interval(
+        ht: hl.Table, 
+        obs: hl.expr.Int32Expression, 
+        exp: hl.expr.Float32Expression,
+        prefix: str = 'oe', 
+        alpha: float = 0.05, 
+        range: float = 2.0,
+        density: int = 1000,
+        select_only_ci_metrics: bool = True
+        ) -> hl.Table:
     '''Calculate CI for observed/expected ratio'''
+    # This function is vectorised over the whole table
     ht = ht.annotate(_obs=obs, _exp=exp)
-    oe_ht = ht.annotate(_range=hl.range(0, 2000).map(lambda x: hl.float64(x) / 1000))
-    oe_ht = oe_ht.annotate(_range_dpois=oe_ht._range.map(lambda x: hl.dpois(oe_ht._obs, oe_ht._exp * x)))
-
-    oe_ht = oe_ht.transmute(_cumulative_dpois=hl.cumulative_sum(oe_ht._range_dpois))
-    max_cumulative_dpois = oe_ht._cumulative_dpois[-1]
-    oe_ht = oe_ht.transmute(_norm_dpois=oe_ht._cumulative_dpois.map(lambda x: x / max_cumulative_dpois))
+    
+    # create l (normalised rate of mutation) in grid array between 0 and 2
+    oe_ht = ht.annotate(_range=(
+        hl.range(0, int(range * density))
+          .map(lambda x: hl.float64(x) / density))
+    )
+    # Poisson probability density p(N_exp * l) of observing N_OBS for a given l
+    oe_ht = oe_ht.annotate(_range_dpois=(
+        oe_ht._range.map(lambda x: 
+            hl.dpois(oe_ht._obs, oe_ht._exp * x)
+    )))
+    # Cumulative probability density that real rate < l (CDF(l | N_obs, N_exp))
+    oe_ht = oe_ht.transmute(
+        _cumulative_dpois=hl.cumulative_sum(oe_ht._range_dpois)
+    )
+    # Extract CDF at top of range scanned
+    oe_ht = oe_ht.annotate(
+        _max_cumulative_dpois = oe_ht._cumulative_dpois[-1]
+    )
+    # Normalise cumulative probabilities (assume less than 2)
+    oe_ht = oe_ht.annotate(
+        _norm_dpois=oe_ht._cumulative_dpois / oe_ht._max_cumulative_dpois
+    )
+    oe_ht = oe_ht.drop('_cumulative_dpois')
+    # Find idx for max P(L < l) < alpha & idx for min P(L < l) > 1 - alpha
     oe_ht = oe_ht.transmute(
         _lower_idx=hl.argmax(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x < alpha, x))),
-        _upper_idx=hl.argmin(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x > 1 - alpha, x)))
+        _upper_idx=hl.argmin(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x > 1 - alpha, x))),
+        P_H0=oe_ht._norm_dpois[density]
     )
+
+ 
     oe_ht = oe_ht.transmute(**{
+        # Lower bound of confidence interval (or 0 if N_obs = 0)
         f'{prefix}_lower': hl.cond(oe_ht._obs > 0, oe_ht._range[oe_ht._lower_idx], 0),
-        f'{prefix}_upper': oe_ht._range[oe_ht._upper_idx]
+        # Upper bound of confidence interval
+        f'{prefix}_upper': oe_ht._range[oe_ht._upper_idx],
+        f'P_tot': oe_ht._max_cumulative_dpois
+
     })
     if select_only_ci_metrics:
-        return oe_ht.select(f'{prefix}_lower', f'{prefix}_upper')
+        return oe_ht.select(f'{prefix}_lower', f'{prefix}_upper',f'P_H0', f'P_tot')
     else:
         return oe_ht.drop('_exp')
 
@@ -418,37 +459,4 @@ def annotate_issues(ht: hl.Table) -> hl.Table:
     reasons = hl.cond(ht.exp_mis > 0, reasons, reasons.add('no_exp_mis'), missing_false=True)
     reasons = hl.cond(ht.exp_lof > 0, reasons, reasons.add('no_exp_lof'), missing_false=True)
     ht = ht.annotate(constraint_flag=reasons)
-    return ht
-
-
-# functions for loading compressed tables from text form to re-run 
-
-def load_or_import_po(path, overwrite):
-    # Specify input format to avoid coercion to string
-    types = {
-        'adjusted_mutation_rate_global': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_global': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_global': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_afr': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_afr': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_afr': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_amr': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_amr': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_amr': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_eas': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_eas': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_eas': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_nfe': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_nfe': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_nfe': hl.expr.types.tarray(hl.tint32),
-        'adjusted_mutation_rate_sas': hl.expr.types.tarray(hl.tfloat64),
-        'expected_variants_sas': hl.expr.types.tarray(hl.tfloat64),
-        'downsampling_counts_sas': hl.expr.types.tarray(hl.tint32)
-        }
-
-    if os.path.isdir(path) and not overwrite:
-            ht = hl.read_table(path)
-    else:
-        ht = hl.import_table(path.replace('.ht','.txt.bgz'),impute=True,types=types)
-        ht.write(path,overwrite)
     return ht

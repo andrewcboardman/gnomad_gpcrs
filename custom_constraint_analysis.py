@@ -47,7 +47,7 @@ def setup_paths(run_ID):
     return paths
 
 
-def run_tasks(tasks, paths, test = False):
+def run_tasks(tasks, paths, model, test = False):
     '''Runs all requested tasks in specified path'''
     data = {}
     
@@ -56,30 +56,21 @@ def run_tasks(tasks, paths, test = False):
         gene_intervals = gnomadIC.get_gene_intervals(test)
         # If in test mode only load 1 gene
         print('Getting data from Google Cloud...')
-        # Load observed mutation data, possible mutation data, and associated data
-        data = gnomadIC.get_data(paths, gene_intervals)
+        # Load observed mutation data, possible mutation data, and annotations
+        data = gnomadIC.get_data(paths, gene_intervals, model)
         print('Data loaded successfully!')
-    
+  
     if 'aggregate' in tasks:
-        if not data:
-            print('Loading data...')
-            data = gnomadIC.load_data_to_aggregate(paths)
         print('Running aggregation of variants by grouping variables...')
-        data = gnomadIC.aggregate(paths, data)
+        data = gnomadIC.aggregate(paths, data, model)
         print('Aggregated variants successfully!')
-       
-    if 'estimate' in tasks:
-        if not data:
-            print('Loading data...')
-            data = gnomadIC.load_data_to_estimate(paths)
-        print('Joining tables and running aggregation by gene')
-        data = gnomadIC.estimate(paths, data, overwrite=args.overwrite)
+
 
 
 def main(args):
     '''Controls whether to setup in test mode or not, and generates a run ID if not in test mode'''
     # Initialise Hail, setting output 
-    hl.init(log='hail_logs/test_load_data.log', quiet=True)
+    hl.init(log='hail_logs/test_load_data.log', quiet=args.quiet)
 
     # Setup paths
     if args.test:
@@ -91,15 +82,16 @@ def main(args):
     paths = setup_paths(run_ID)
     
     # Run chosen tasks
-    run_tasks(args.tasks, paths = paths, test=args.test)
+    run_tasks(args.tasks, paths = paths, model = args.model, test=args.test)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--test', help='Run tests',action='store_true')
+    parser.add_argument('--test', help='Run tests',action='store_true',default=False)
+    parser.add_argument('-q','--quiet',help='Run in quiet mode',action='store_true',default=False)
     parser.add_argument('--overwrite', help='Overwrite everything', action='store_true')
     parser.add_argument('--dataset', help='Which dataset to use (one of gnomad, non_neuro, non_cancer, controls)', default='gnomad')
-    parser.add_argument('--model', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now) - warning not implemented', default='standard')
-    parser.add_argument('--tasks', nargs='+', help='Which tasks to perform (select from load_data, aggregate, estimate)')
+    parser.add_argument('--model', nargs= '+', help='Which model to apply (one of "standard", "syn_canonical", or "worst_csq" for now) - warning not implemented', default='standard')
+    parser.add_argument('--tasks', nargs='+', help='Which tasks to perform (select from load_data, aggregate)')
     args = parser.parse_args()
     main(args)
