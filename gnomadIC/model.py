@@ -47,7 +47,7 @@ def load_models(paths):
     # Get coverage models if they don't exist
     if os.path.isfile(paths['coverage_models_local_path']):
         # Load local coverage models
-        with open('data/coverage_models.pkl','rb') as fid:
+        with open(paths['coverage_models_local_path'],'rb') as fid:
             coverage_model, plateau_models = pickle.load(fid)
     else:
         if os.path.isdir(paths['po_coverage_local_path']):
@@ -59,7 +59,7 @@ def load_models(paths):
             coverage_ht.write(paths['po_coverage_local_path'])
         # Build models from coverage table
         coverage_model, plateau_models = utils.build_models(coverage_ht, trimers=True) 
-        with open('data/coverage_models.pkl','wb') as fid:
+        with open(paths['coverage_models_local_path'],'wb') as fid:
             pickle.dump((coverage_model,plateau_models),fid)  
 
     models = {
@@ -131,60 +131,17 @@ def get_proportion_observed(
     }
     observed_variants_ht = exome_ht.group_by(*grouping).aggregate(**agg_expr)
     obs_path = proportion_variants_observed_ht_path.replace('.ht','_raw.ht')
-    observed_variants_ht.write(obs_path)
+    observed_variants_ht.write(obs_path,overwrite=overwrite)
 
     # Merge observed variants with expected variants
     observed_variants_ht = hl.read_table(obs_path)
+    # Why does this join lead to variable duplication? Think it's because of missing values
     observed_variants_ht = observed_variants_ht.join(expected_variants_ht, 'outer')
-    observed_variants_ht.write(proportion_variants_observed_ht_path,overwrite)
+    observed_variants_ht.write(proportion_variants_observed_ht_path,overwrite=overwrite)
     return observed_variants_ht
 
 
-def summarise_prop_observed(po_ht, summary_path):
-    """ Function for drawing final inferences from observed and expected variant counts"""
-    # This seems to do a lot of sorting/coercing and maybe could be improved dramatically by a key change at the beginning
-    
-    keys = ('gene', 'transcript', 'canonical')
-    po_ht = po_ht.key_by(*keys)
-    
-    classic_lof_annotations = hl.literal({'stop_gained', 'splice_donor_variant', 'splice_acceptor_variant'})
-    filtered_tables = dict(
-        lof_classic = po_ht.filter(classic_lof_annotations.contains(po_ht.annotation) & ((po_ht.modifier == 'HC') | (po_ht.modifier == 'LC'))),
-        lof_hc = po_ht.filter(po_ht.modifier == 'HC'),
-        lof_classic_hc = po_ht.filter((po_ht.modifier == 'HC') | (po_ht.modifier == 'OS')),
-        mis = po_ht.filter(po_ht.annotation == 'missense_variant'),
-        mis_pphen = po_ht.filter(po_ht.modifier == 'probably_damaging'),
-        mis_non_pphen = po_ht.filter((po_ht.modifier != 'probably_damaging') & (po_ht.annotation == 'missense_variant')),
-        syn = po_ht.filter(po_ht.annotation == 'synonymous_variant')
-    )
-    output = []
-    for i, (table_name, table) in enumerate(zip(filtered_tables.keys(), filtered_tables.values())):
-        # if table_name.startswith('lof'):
-        #     table_agg = utils.collapse_lof_ht(table, keys)
-        # else:
-        agg_expr = {
-            'obs': hl.agg.sum(table.observed_variants),
-            'exp': hl.agg.sum(table.expected_variants),
-            'oe': hl.agg.sum(table.observed_variants) / hl.agg.sum(table.expected_variants),
-            'adj_mu': hl.agg.sum(table.adjusted_mutation_rate),
-            'raw_mu': hl.agg.sum(table.raw_mutation_rate),
-            'poss': hl.agg.sum(table.possible_variants)
-        }
-        table_agg = table.group_by(*table.key).aggregate(**agg_expr)
-        #table_agg.write(summary_path.replace('.ht',f'_{table_name}.ht'))
-        # calculate confidence intervals, join tables and label
-        table_agg = utils.oe_confidence_interval(table_agg, table_agg.obs, table_agg.exp, select_only_ci_metrics=False)
-        # label names
-        table_agg = table_agg.select_globals().select(*list(agg_expr.keys())).to_pandas()
-        table_agg['metric'] = table_name
-        table_agg.to_csv(summary_path.replace('.ht',f'_{table_name}.csv.gz'),compression='gzip')
-        output.append(table_agg)
-    finalised_output = pd.concat(output)
-    finalised_output.to_csv(summary_path.replace('.ht','.csv.gz'),compression='gzip')
-    return finalised_output
-
-
-def aggregate(paths, data, model):
+def model(paths, data, model):
     '''
     This is the new master function for performing constraint analysis
     Possible variants for populations currently switched off
@@ -224,7 +181,8 @@ def aggregate(paths, data, model):
             data['exomes'][table],
             expected_variants_ht,
             data['grouping'],
-            paths['po_output_path'].replace('.ht',f'_{table}.ht'))
+            paths['po_output_path'].replace('.ht',f'_{table}.ht'), 
+            overwrite=True)
         data['prop_observed'][table] = prop_observed_ht
 
     # Take union of answers and write to file
@@ -235,6 +193,5 @@ def aggregate(paths, data, model):
                 )
     data['prop_observed_ht'].write(paths['po_output_path'], overwrite=True)
 
-    data['summary'] = summarise_prop_observed(data['prop_observed_ht'], paths['summary_output_path'])
     
     return data

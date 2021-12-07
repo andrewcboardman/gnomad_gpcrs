@@ -8,22 +8,6 @@ import pandas as pd
 from typing import Dict, List, Optional, Set, Tuple, Any
 from .utils import utils
 
-def get_gene_intervals(test=False):
-    # Get Ensembl gene intervals from file
-    df_intervals = pd.read_csv('data/Ensembl_Grch37_gpcr_genome_locations.csv')
-    df_intervals = df_intervals[['HGNC symbol','Grch37 symbol','Grch37 chromosome','Grch37 start bp','Grch37 end bp']]
-    df_intervals['locus_interval_txt'] = df_intervals['Grch37 chromosome'] + ':'  + \
-        + df_intervals['Grch37 start bp'].map(str) + '-' + df_intervals['Grch37 end bp'].map(str)
-    df_intervals['interval'] = df_intervals['locus_interval_txt'].map(hl.parse_locus_interval)
-
-    if test:
-        df_intervals = df_intervals.sample(n=1,random_state=0)
-        print(f"{str(df_intervals['HGNC symbol'].values[0])} chosen as test gene")
-        return df_intervals['interval'].tolist()
-    else:
-        return df_intervals['interval'].tolist()
-
-
 def get_mutation_annotations(model):    
     # Get custom annotations for mutations from file
     df_annotations = pd.read_csv('data/mutation_annotations.csv')

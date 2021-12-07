@@ -377,7 +377,7 @@ def oe_confidence_interval(
         exp: hl.expr.Float32Expression,
         prefix: str = 'oe', 
         alpha: float = 0.05, 
-        range: float = 2.0,
+        range: float = 3.0,
         density: int = 1000,
         select_only_ci_metrics: bool = True
         ) -> hl.Table:
@@ -390,42 +390,40 @@ def oe_confidence_interval(
         hl.range(0, int(range * density))
           .map(lambda x: hl.float64(x) / density))
     )
-    # Poisson probability density p(N_exp * l) of observing N_OBS for a given l
+    # Poisson probability mass Po(N_exp * l) of observing N_obs for a given rate
     oe_ht = oe_ht.annotate(_range_dpois=(
         oe_ht._range.map(lambda x: 
             hl.dpois(oe_ht._obs, oe_ht._exp * x)
     )))
-    # Cumulative probability density that real rate < l (CDF(l | N_obs, N_exp))
+    # Sum of probility mass for rates up to l
     oe_ht = oe_ht.transmute(
         _cumulative_dpois=hl.cumulative_sum(oe_ht._range_dpois)
     )
-    # Extract CDF at top of range scanned
+    # Total sum of probability mass for range scanned
     oe_ht = oe_ht.annotate(
         _max_cumulative_dpois = oe_ht._cumulative_dpois[-1]
     )
-    # Normalise cumulative probabilities (assume less than 2)
-    oe_ht = oe_ht.annotate(
+    # Normalise to obtain probability that true constraint > l (assume less than limit)
+    oe_ht = oe_ht.transmute(
         _norm_dpois=oe_ht._cumulative_dpois / oe_ht._max_cumulative_dpois
     )
-    oe_ht = oe_ht.drop('_cumulative_dpois')
-    # Find idx for max P(L < l) < alpha & idx for min P(L < l) > 1 - alpha
+    # Find idx for max P(L < l) < alpha
+    #  idx for min P(L < l) > 1 - alpha
+    # log P(L > 1)
     oe_ht = oe_ht.transmute(
         _lower_idx=hl.argmax(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x < alpha, x))),
         _upper_idx=hl.argmin(oe_ht._norm_dpois.map(lambda x: hl.or_missing(x > 1 - alpha, x))),
-        P_H0=oe_ht._norm_dpois[density]
+        logP_H0= hl.log(hl.literal(1) - oe_ht._norm_dpois[density])
     )
-
  
     oe_ht = oe_ht.transmute(**{
         # Lower bound of confidence interval (or 0 if N_obs = 0)
         f'{prefix}_lower': hl.cond(oe_ht._obs > 0, oe_ht._range[oe_ht._lower_idx], 0),
         # Upper bound of confidence interval
-        f'{prefix}_upper': oe_ht._range[oe_ht._upper_idx],
-        f'P_tot': oe_ht._max_cumulative_dpois
-
+        f'{prefix}_upper': oe_ht._range[oe_ht._upper_idx]
     })
     if select_only_ci_metrics:
-        return oe_ht.select(f'{prefix}_lower', f'{prefix}_upper',f'P_H0', f'P_tot')
+        return oe_ht.select(f'{prefix}_lower', f'{prefix}_upper',f'log_P_H0')
     else:
         return oe_ht.drop('_exp')
 

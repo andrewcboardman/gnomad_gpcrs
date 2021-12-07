@@ -1,0 +1,109 @@
+---
+title: "human_protein_atlas_data_extraction"
+output: html_document
+---
+
+```{r}
+library(HPAanalyze)
+library(dplyr)
+library(tidyr)
+library(tibble)
+```
+
+
+```{r}
+GPCR.genes <- read.csv('../data/gene_annotations/GuideToPharm_GPCR_targets_refined_060121.csv',stringsAsFactors = F)
+GPCR.genes <- GPCR.genes[c('HGNC.symbol','Ensembl.Id.Grch38')]
+GPCR.genes
+```
+
+```{r}
+tissue <- HPAanalyze::hpaDownload('Normal tissue')
+```
+```{r}
+gpcr.tissue.expression <- HPAanalyze::hpaSubset(tissue,GPCR.genes$HGNC.symbol)
+```
+
+```{r}
+gpcr.tissue.expression.max <- gpcr.tissue.expression$normal_tissue %>%
+  mutate(level=factor(
+    level,
+    levels = c('Not detected','Low','Medium','High'),
+    ordered=T)
+    ) %>% 
+  group_by(gene,tissue) %>% 
+  summarise(expression=max(level))
+```
+```{r}
+gpcr.tissue.expression.max %>% 
+  write.csv('../data/tissue_expression/raw_protein_expression_by_tissue.csv',row.names = F)
+```
+
+```{r}
+genes_tested <- gpcr.tissue.expression.max %>% 
+  group_by(gene) %>% 
+  summarise(n_tested = length(expression)) %>% 
+  filter(n_tested > 40) %>% 
+  pull(gene)
+```
+
+```{r}
+tissues_tested <- gpcr.tissue.expression.max %>% 
+  group_by(tissue) %>% 
+  summarise(n_tested = length(expression)) %>% 
+  filter(n_tested > 150) %>% 
+  pull(tissue)
+```
+
+
+```{r}
+gpcr.tissue.expression.max %>% 
+  filter(gene %in% genes_tested & tissue %in% tissues_tested) %>% 
+  ungroup() %>% 
+  summarise(sum(is.na(expression)))
+```
+
+
+```{r}
+gpcr.tissue.expression.wide <- gpcr.tissue.expression.max %>% 
+  filter(gene %in% genes_tested & tissue %in% tissues_tested) %>% 
+  pivot_wider(
+    id_cols = c('gene'),
+    names_from = c('tissue'),
+    values_from = c('expression'),
+    values_fill='Not detected'
+  )
+)
+gpcr.tissue.expression.wide %>% 
+  write.csv('../data/tissue_expression/filtered_protein_expression_by_tissue.csv')
+```
+
+
+```{r}
+gpcr.tissue.expression.wide %>% 
+  ungroup() %>% 
+  column_to_rownames('gene') %>% 
+  mutate_all(as.numeric) %>% 
+  as.matrix() %>% 
+  dist() %>% hclust() %>% plot()
+```
+```{r}
+gpcr.tissue.expression.wide %>% 
+  ungroup() %>% 
+  column_to_rownames('gene') %>% 
+  mutate_all(as.numeric) %>% 
+  as.matrix() %>% 
+  cluster::daisy(metric='gower') %>% 
+  as.matrix() %>% 
+  heatmap()
+```
+```{r}
+tissue.expression.pca <- gpcr.tissue.expression.wide %>% 
+  ungroup() %>% 
+  column_to_rownames('gene') %>% 
+  mutate_all(as.numeric) %>% 
+  as.matrix() %>% 
+  prcomp()
+plot(tissue.expression.pca$x[,1],tissue.expression.pca$x[,3])
+```
+

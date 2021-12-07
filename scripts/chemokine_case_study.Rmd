@@ -1,0 +1,47 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+
+```{r}
+rm(list=ls())
+library(phylogram)
+library(tidyr)
+library(tibble)
+```
+
+```{r}
+chemokine.dendrogram <- read.dendrogram(file='../data/GPCR_structure_clustering.tree')
+plot(chemokine.dendrogram,yaxt='n')
+```
+```{r}
+chemokine_position_constraint <-  read.csv('../data/gnomAD_population_variants/gnomad_v2.1.1_chemokine_position_constraint.csv',row.names = 1,stringsAsFactors = F)
+head(chemokine_position_constraint)
+```
+
+
+```{r}
+chemokine_position_constraint_wide = chemokine_position_constraint %>% 
+  pivot_wider(
+    id_cols = 'HGNC.symbol',
+    names_from = 'GPCRdb_alignment_number',
+    values_from = 'oe_missense_position'
+  ) %>% 
+  column_to_rownames('HGNC.symbol') 
+n_missing_by_col <- chemokine_position_constraint_wide %>% 
+  is.na() %>% colSums()
+complete_cols <- (n_missing_by_col == 0) %>% 
+  which() %>% names() %>% sort()
+chemokine_position_constraint_wide <- chemokine_position_constraint_wide[,complete_cols]
+head(chemokine_position_constraint_wide)
+```
+```{r}
+heatmap(as.matrix(chemokine_position_constraint_wide),Colv = NA)
+```
+
+
+```{r}
+heatmap(na.omit(chemokine_position_constraint_wide,)
+```
+
