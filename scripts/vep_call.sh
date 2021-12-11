@@ -1,1 +1,0 @@
-~/Packages/ensembl-vep/vep --force_overwrite --cache --config config.txt -i test_data/test_synthetic_variants.txt -o test_data/test_synthetic_variants_output.txt --protein --tab --polyphen b -sift b --plugin LoF,loftee_path:/home/andrew/Packages/loftee --dir_plugins ~/Packages/loftee --fork 4
